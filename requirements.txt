@@ -1,0 +1,11 @@
+torch
+gym
+wandb
+ipdb
+tensorboard
+pandas
+zmq
+tqdm
+matplotlib
+cvxpy
+gurobipy
