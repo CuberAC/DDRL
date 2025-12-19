@@ -287,7 +287,7 @@ class LSTMTrainer(DDRLTrainer):
             return rews 
         else:
             return {
-                'lmp':np.concatenate(lmps, axis=0),
+                'lmp':np.stack(lmps, axis=0),
                 'soc': torch.stack(socs).cpu().numpy(),
                 'action': torch.stack(actions).cpu().numpy(),
                 'reward': torch.stack(rews).cpu().numpy(),

@@ -195,7 +195,7 @@ if __name__ == "__main__":
                 plt.tight_layout()
                 plt.savefig(save_path)
                 plt.close(fig)
-                # print(f"Plot saved to {save_path}")
+                print(f"Plot saved to {save_path}")
                 
             except Exception as e:
                 print(f"Error plotting evaluation results: {e}")
