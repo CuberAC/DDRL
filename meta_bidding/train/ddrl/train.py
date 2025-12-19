@@ -21,7 +21,7 @@ parser.add_argument("--eps_len",default=4,type=int,help="episode length in each 
 parser.add_argument("--save_model_freq",default=50,help="save model frequency (in num epoches)")
 parser.add_argument("--lr",default=1e-3,type=float,help="learning rate for network")
 parser.add_argument("--random_seed",default=0,type=float,help="set random seed if required (0 = no random seed)")
-parser.add_argument("--eval_freq",default=10,type=int,help="evaluation frequency (in num epoches)")
+parser.add_argument("--eval_freq",default=2,type=int,help="evaluation frequency (in num epoches)")
 
 parser.add_argument("--trainer", default="lstm",type=str, help="mlp, rnn, cnn, transformer")
 parser.add_argument("--data_source",default="train",type=str,help="train, 2021, 2020")
@@ -157,6 +157,7 @@ if __name__ == "__main__":
                 rt_action = eval_results['rt_action'][:288, 0, :] # (288, 9)
                 soc = eval_results['soc'][:288, 0] # (288,)
                 lmp = eval_results['lmp'][:288, 0, :] # (288, 9)
+                lmp_da = eval_results['lmp_da'][:288, 0, :] # (288, 9)
                 
                 fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
                 
@@ -183,9 +184,11 @@ if __name__ == "__main__":
                 
                 # Subplot 3: Price (Energy Market)
                 axes[2].plot(lmp[:, 0], label='RT Price', color='orange')
+                axes[2].plot(lmp_da[:, 0], label='DA Price', color='cyan', linestyle='--')
                 axes[2].set_ylabel('Price ($/MWh)')
                 axes[2].set_title('Energy Price')
                 axes[2].set_xlabel('Time Step (5-min)')
+                axes[2].legend()
                 axes[2].grid(True, alpha=0.3)
                 
                 # Save Plot

@@ -453,10 +453,26 @@ class MetaDatasetAEMO(MetaDataset):
                                     - (50/self.beta**2) * (new_soc - self.beta)**2 * (new_soc<(self.beta))
         reward_soc_violation = reward_soc_equivalent_price * self.MAXP
         
+        # --- Deviation Penalty ---
+        reward_deviation_penalty = 0
+        if action_da is not None:
+            # 1. Penalty Rate: 1.5 * Mean RT Price (Global Mean)
+            penalty_rate = 1.5 * torch.tensor(self.price_mean.values, device=self.device, dtype=torch.float32)
+            
+            # 2. Deviation Magnitude: |RT - DA|
+            # Energy
+            deviation_abs = torch.abs(energy_action_rt - energy_action_da) * penalty_rate[0]
+            # AS Markets
+            for i in range(8):
+                deviation_abs += torch.abs(as_rt[i] - as_da[i]) * penalty_rate[i+1]
+            
+            # 3. Calculate Penalty (Negative Reward)
+            reward_deviation_penalty = -1.0 * deviation_abs * self.MAXP
+
         if not verbose_profit: # Training
-            rew = reward_market_revenue + reward_degradation + reward_soc_violation
+            rew = reward_market_revenue + reward_degradation + reward_soc_violation + reward_deviation_penalty
         else: # testingp_max
-            rew = reward_market_revenue + reward_degradation
+            rew = reward_market_revenue + reward_degradation + reward_deviation_penalty
 
         self._pcs = (self._pcs+1)%self.dataset_size
 
@@ -464,6 +480,7 @@ class MetaDatasetAEMO(MetaDataset):
         if verbose_profit:
             info = {
                 'rew_soc_violation':(reward_soc_violation + energy_reward*(energy_rew_discount-1)).cpu().numpy(),
+                'lmp_da': lmps_da_numpy,
             }
             if action_da is not None:
                 # Calculate DA Revenue for stats
@@ -475,6 +492,7 @@ class MetaDatasetAEMO(MetaDataset):
                 info['rev_da'] = rev_da.cpu().numpy()
                 info['rev_total'] = reward_market_revenue.cpu().numpy()
                 info['rev_rt_deviation'] = info['rev_total'] - info['rev_da']
+                info['penalty_dev'] = reward_deviation_penalty.cpu().numpy()
 
         if not verbose_profit:
             return self._soc[-1],rew,lmps_rt_numpy, None

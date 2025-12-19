@@ -56,6 +56,7 @@ class DDRLTrainer(nn.Module):
         # 1. Initialize logs container
         logs = {
             'lmp': [], 
+            'lmp_da': [],
             'soc': [], 
             'rt_action': [], 
             'da_action': [], 
@@ -71,6 +72,7 @@ class DDRLTrainer(nn.Module):
             
             # Collect Time-Series Data (Concatenate along time axis later)
             logs['lmp'].append(info['lmp'])
+            logs['lmp_da'].append(info['lmp_da'])
             logs['soc'].append(info['soc'])
             logs['rt_action'].append(info['action'])
             logs['reward'].append(info['reward'])
@@ -91,6 +93,7 @@ class DDRLTrainer(nn.Module):
         # Concatenate time-series data (Total Steps = seq_len * 288)
         # Shape: (Total_Steps, Batch, ...)
         results['lmp'] = np.concatenate(logs['lmp'], axis=0)
+        results['lmp_da'] = np.concatenate(logs['lmp_da'], axis=0)
         results['soc'] = np.concatenate(logs['soc'], axis=0)
         results['rt_action'] = np.concatenate(logs['rt_action'], axis=0)
         results['reward'] = np.concatenate(logs['reward'], axis=0)
@@ -222,6 +225,7 @@ class LSTMTrainer(DDRLTrainer):
 
         # get action for each five minutes
         socs, rews, lmps, actions = [],[],[],[]
+        lmps_da = []
         for hour in range(24):
             # Get DA action for this hour
             da_action_current_hour = da_plan_24h[:, :, hour] # Shape: (Batch, 9)
@@ -281,6 +285,8 @@ class LSTMTrainer(DDRLTrainer):
                 rews.append(rew)
                 lmps.append(lmp)
                 actions.append(action_rt)
+                if verbose:
+                    lmps_da.append(info['lmp_da'])
 
         # 4. return the key information of today the next_day observations for bidding
         if not verbose:
@@ -288,6 +294,7 @@ class LSTMTrainer(DDRLTrainer):
         else:
             return {
                 'lmp':np.stack(lmps, axis=0),
+                'lmp_da':np.stack(lmps_da, axis=0),
                 'soc': torch.stack(socs).cpu().numpy(),
                 'action': torch.stack(actions).cpu().numpy(),
                 'reward': torch.stack(rews).cpu().numpy(),
