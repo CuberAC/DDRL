@@ -60,11 +60,11 @@ class MetaDatasetAEMO(MetaDataset):
     def parse_data(self,env_config):
 
         data_paths = {
-            "train": "meta_bidding/data/aemo_data/aemo_price_train.pkl",
-            "test": "meta_bidding/data/aemo_data/aemo_price_test.pkl",
+            "train": "meta_bidding/data/aemo_data/aemo_price_train_dual.pkl",
+            "test": "meta_bidding/data/aemo_data/aemo_price_test_dual.pkl",
         }
 
-        self.market_keys = [
+        self.market_keys_rt = [
             'RRP',
             'RAISEREGRRP',
             'LOWERREGRRP',
@@ -75,6 +75,8 @@ class MetaDatasetAEMO(MetaDataset):
             'LOWER60SECRRP',
             'LOWER5MINRRP',
         ]
+        self.market_keys_da = ['DA_' + key for key in self.market_keys_rt]
+        self.market_keys = self.market_keys_rt # Compatibility
 
         # Load Data
         module_root_path = os.path.dirname(os.path.dirname(os.path.abspath(meta_bidding.__file__)))
@@ -102,14 +104,29 @@ class MetaDatasetAEMO(MetaDataset):
         # load mean std information
         mean_std_data_path = os.path.join(module_root_path,data_paths["train"])
         df_train = pd.read_pickle(mean_std_data_path)
-        self.price_mean = df_train[self.market_keys].mean()
-        self.price_std = df_train[self.market_keys].std()
+        self.price_mean = df_train[self.market_keys_rt].mean()
+        self.price_std = df_train[self.market_keys_rt].std()
         
 
         # numpify the price data
-        self._lmp = self.df_data[self.market_keys].to_numpy()
-        self._lmp_normalized = (self.df_data[self.market_keys]-self.price_mean)/self.price_std
-        self._lmp_normalized = self._lmp_normalized.to_numpy()
+        # A. Process Real-Time Data (RT)
+        self._lmp_rt = self.df_data[self.market_keys_rt].to_numpy()
+        self._lmp_rt_normalized = (self.df_data[self.market_keys_rt]-self.price_mean)/self.price_std
+        self._lmp_rt_normalized = self._lmp_rt_normalized.to_numpy()
+
+        # B. Process Day-Ahead Data (DA)
+        if set(self.market_keys_da).issubset(self.df_data.columns):
+            self._lmp_da = self.df_data[self.market_keys_da].to_numpy()
+            # IMPORTANT: Normalize DA using RT stats to preserve price spread
+            self._lmp_da_normalized = (self.df_data[self.market_keys_da].values - self.price_mean.values) / self.price_std.values
+        else:
+            print("\033[91mWARNING: Day-Ahead (DA) data not found. Fallback: Copying RT data to DA.\033[0m")
+            self._lmp_da = self._lmp_rt.copy()
+            self._lmp_da_normalized = self._lmp_rt_normalized.copy()
+
+        # C. Compatibility Aliases
+        self._lmp = self._lmp_rt
+        self._lmp_normalized = self._lmp_rt_normalized
 
         # Generate normalized price range for sampling supply curves
         self.M = 256
@@ -341,31 +358,47 @@ class MetaDatasetAEMO(MetaDataset):
 
 
     
-    def mini_batch_step(self, actions,verbose_profit = False):
+    def mini_batch_step(self, action_rt, action_da=None, verbose_profit = False):
         """
             Run 24*1h steps in the environment
-            input: actions: 24*(batch_size), type: List[torch.tensor]
+            input: action_rt: (batch_size, 9), type: torch.tensor (Raw Actions)
+                   action_da: (batch_size, 9), type: torch.tensor (Raw Actions) or None
             output: soc: 24h*(batch_size, 1), type: List[torch.tensor]
                     rew: 24h*(batch_size, 1), type: List[torch.tensor]
         """
-        # retrieve the minibatch states
-        lmps_numpy = self._lmp[self._pcs]
-        lmps = torch.tensor(lmps_numpy, dtype=torch.float32).to(self.device) # shape: (9, batchsize)
+        # 1. Retrieve Prices
+        lmps_rt_numpy = self._lmp_rt[self._pcs]
+        lmps_rt = torch.tensor(lmps_rt_numpy, dtype=torch.float32).to(self.device) # shape: (9, batchsize)
+        
+        lmps_da_numpy = self._lmp_da[self._pcs]
+        lmps_da = torch.tensor(lmps_da_numpy, dtype=torch.float32).to(self.device)
 
-        energy_action, regup_action, regdown_action, res6sup_action, res60sup_action, res5minup_action, res6sdown_action, res60sdown_action, res5mindown_action = actions
+        # 2. Action Processing (Raw -> Physical)
+        # RT Actions (Physical Reality)
+        (energy_action_rt, regup_action_rt, regdown_action_rt, 
+         res6sup_action_rt, res60sup_action_rt, res5minup_action_rt, 
+         res6sdown_action_rt, res60sdown_action_rt, res5mindown_action_rt) = self.get_action(action_rt, verbose_profit=verbose_profit)
 
+        # DA Actions (Financial Commitment)
+        if action_da is not None:
+            # DA actions are not constrained by RT SoC, so verbose_profit=False
+            (energy_action_da, regup_action_da, regdown_action_da, 
+             res6sup_action_da, res60sup_action_da, res5minup_action_da, 
+             res6sdown_action_da, res60sdown_action_da, res5mindown_action_da) = self.get_action(action_da, verbose_profit=False)
+
+        # 3. Physics Update (Based ONLY on RT)
         # Change Step SoC
-        discharge_soc_action = energy_action*(energy_action>0) + 0.25*regup_action/self.EFFICIENCY
-        charge_soc_action = energy_action*(energy_action<=0) - 0.25*regdown_action/self.EFFICIENCY
+        discharge_soc_action = energy_action_rt*(energy_action_rt>0) + 0.25*regup_action_rt/self.EFFICIENCY
+        charge_soc_action = energy_action_rt*(energy_action_rt<=0) - 0.25*regdown_action_rt/self.EFFICIENCY
         total_soc_discharge_action = discharge_soc_action + charge_soc_action
         new_soc = self._soc[-1]-self.MAXPRTRATIO*total_soc_discharge_action
         self._soc.append(new_soc)
 
-        # Calculate the mean charging price
+        # Calculate the mean charging price (RT)
         with torch.no_grad():
             clipped_ori_soc = torch.clamp(self._soc[-2],0,1)
             clipped_new_soc =torch.clamp(self._soc[-1],0,1)
-            energy_lmp = lmps[:,0]            
+            energy_lmp = lmps_rt[:,0]            
             self._mcp = (total_soc_discharge_action>=0) * self._mcp +\
                         (total_soc_discharge_action<0)*(clipped_ori_soc*self._mcp+(clipped_new_soc-clipped_ori_soc)*energy_lmp)/(clipped_new_soc+1e-7)
             self._mcp = torch.clip(self._mcp,-200,500)
@@ -375,24 +408,51 @@ class MetaDatasetAEMO(MetaDataset):
         energy_rew_discount = 1 - torch.sigmoid((new_soc-1)*6/self.beta) * (new_soc>(1-self.beta))\
                                 - torch.sigmoid(-new_soc*6/self.beta) * (new_soc<self.beta)
         
-        # Calculate  Reward
-        energy_reward = (energy_action*lmps[:,0]+ 0.25*regup_action*lmps[:,0] - 0.25*regdown_action*lmps[:,0])
+        # 4. Financial Settlement (Two-Stage)
+        # Helper for settlement: R = Q_da * P_da + (Q_rt - Q_da) * P_rt
+        def settlement(q_rt, q_da, p_rt, p_da):
+            if q_da is None:
+                return q_rt * p_rt
+            return q_da * p_da + (q_rt - q_da) * p_rt
+
+        # Energy Market
+        # Base Energy
+        rev_energy_base = settlement(energy_action_rt, energy_action_da if action_da is not None else None, lmps_rt[:,0], lmps_da[:,0])
+        # Regulation Energy (RT only)
+        rev_reg_energy = (0.25*regup_action_rt*lmps_rt[:,0] - 0.25*regdown_action_rt*lmps_rt[:,0])
+        
+        energy_reward = rev_energy_base + rev_reg_energy
+
         if not verbose_profit: # Training
             energy_reward = energy_reward * energy_rew_discount
-        reward_market_revenue = energy_reward\
-                            +regup_action*lmps[:,1]\
-                            +regdown_action*lmps[:,2]\
-                            +res6sup_action*lmps[:,3]\
-                            +res60sup_action*lmps[:,4]\
-                            +res5minup_action*lmps[:,5]\
-                            +res6sdown_action*lmps[:,6]\
-                            +res60sdown_action*lmps[:,7]\
-                            +res5mindown_action*lmps[:,8]
+        
+        # AS Markets
+        reward_market_revenue = energy_reward
+        
+        # List of AS components for iteration
+        as_rt = [regup_action_rt, regdown_action_rt, res6sup_action_rt, res60sup_action_rt, 
+                 res5minup_action_rt, res6sdown_action_rt, res60sdown_action_rt, res5mindown_action_rt]
+        
+        if action_da is not None:
+            as_da = [regup_action_da, regdown_action_da, res6sup_action_da, res60sup_action_da, 
+                     res5minup_action_da, res6sdown_action_da, res60sdown_action_da, res5mindown_action_da]
+        else:
+            as_da = [None] * 8
+
+        for i in range(8):
+            # Market index i+1
+            reward_market_revenue += settlement(as_rt[i], as_da[i], lmps_rt[:,i+1], lmps_da[:,i+1])
+
         reward_market_revenue = reward_market_revenue * self.MAXP
-        reward_degradation = - self.DEGRATIO*self.MAXP*(energy_action*(energy_action>0) + 0.25*regup_action)
+        
+        # Degradation (RT)
+        reward_degradation = - self.DEGRATIO*self.MAXP*(energy_action_rt*(energy_action_rt>0) + 0.25*regup_action_rt)
+        
+        # SoC Violation (RT)
         reward_soc_equivalent_price = - (50/self.beta**2) * (new_soc - (1-self.beta))**2 * (new_soc>(1-self.beta))\
                                     - (50/self.beta**2) * (new_soc - self.beta)**2 * (new_soc<(self.beta))
         reward_soc_violation = reward_soc_equivalent_price * self.MAXP
+        
         if not verbose_profit: # Training
             rew = reward_market_revenue + reward_degradation + reward_soc_violation
         else: # testingp_max
@@ -400,10 +460,26 @@ class MetaDatasetAEMO(MetaDataset):
 
         self._pcs = (self._pcs+1)%self.dataset_size
 
-        if not verbose_profit:
-            return self._soc[-1],rew,lmps_numpy, None
+        info = None
         if verbose_profit:
-            return self._soc[-1],rew,lmps_numpy,{'rew_soc_violation':(reward_soc_violation + energy_reward*(energy_rew_discount-1)).cpu().numpy(),}
+            info = {
+                'rew_soc_violation':(reward_soc_violation + energy_reward*(energy_rew_discount-1)).cpu().numpy(),
+            }
+            if action_da is not None:
+                # Calculate DA Revenue for stats
+                rev_da = energy_action_da * lmps_da[:,0]
+                for i in range(8):
+                    rev_da += as_da[i] * lmps_da[:,i+1]
+                rev_da = rev_da * self.MAXP
+                
+                info['rev_da'] = rev_da.cpu().numpy()
+                info['rev_total'] = reward_market_revenue.cpu().numpy()
+                info['rev_rt_deviation'] = info['rev_total'] - info['rev_da']
+
+        if not verbose_profit:
+            return self._soc[-1],rew,lmps_rt_numpy, None
+        else:
+            return self._soc[-1],rew,lmps_rt_numpy, info
 
     def get_minibatch_obs_rnn(self):
         """"

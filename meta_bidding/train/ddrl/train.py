@@ -5,6 +5,7 @@ import wandb
 import numpy as np
 from ddrl_trainer import LSTMTrainer
 import torch
+import matplotlib.pyplot as plt
 
 import argparse
 parser = argparse.ArgumentParser()
@@ -118,6 +119,10 @@ if __name__ == "__main__":
     # logging file
     log_f = open(log_f_name,"w+")
     log_f.write('episode,timestep,reward\n')
+    
+    # Create plot directory
+    plot_dir = directory + "plots/"
+    os.makedirs(plot_dir, exist_ok=True)
 
     # logging wandb
     wandb.init(
@@ -139,9 +144,63 @@ if __name__ == "__main__":
 
         if step % args.eval_freq == 0:
             with torch.no_grad():
-                eval_rew = trainer.evaluate_eps()
-            wandb.log({"eval_reward": np.clip(eval_rew,-10,np.inf)})
-            print("Eval Reward : {}".format(eval_rew))
+                eval_results = trainer.evaluate_eps()
+            
+            # Extract mean profit for logging
+            mean_profit = eval_results['mean_profit']
+            wandb.log({"eval_reward": np.clip(mean_profit,-10,np.inf)})
+            print("Eval Reward : {}".format(mean_profit))
+            
+            # --- Plotting Logic ---
+            try:
+                # Data Slicing: Agent 0, Day 0 (First 288 steps)
+                rt_action = eval_results['rt_action'][:288, 0, :] # (288, 9)
+                soc = eval_results['soc'][:288, 0] # (288,)
+                lmp = eval_results['lmp'][:288, 0, :] # (288, 9)
+                
+                fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
+                
+                # Subplot 1: Actions (Energy Market)
+                axes[0].plot(rt_action[:, 0], label='RT Energy Action', color='blue')
+                
+                if 'da_action' in eval_results and eval_results['da_action'] is not None:
+                    da_action = eval_results['da_action'][0, 0, :, :] # (9, 24)
+                    # Repeat DA action to match 5-min resolution (24 -> 288)
+                    da_action_energy = np.repeat(da_action[0, :], 12)
+                    axes[0].plot(da_action_energy, label='DA Energy Plan', color='red', linestyle='--', alpha=0.7)
+                
+                axes[0].set_ylabel('Power (MW)')
+                axes[0].set_title(f'Actions (Step {step})')
+                axes[0].legend()
+                axes[0].grid(True, alpha=0.3)
+
+                # Subplot 2: SoC
+                axes[1].plot(soc, label='SoC', color='green')
+                axes[1].set_ylabel('SoC (0-1)')
+                axes[1].set_ylim(-0.1, 1.1)
+                axes[1].set_title('State of Charge')
+                axes[1].grid(True, alpha=0.3)
+                
+                # Subplot 3: Price (Energy Market)
+                axes[2].plot(lmp[:, 0], label='RT Price', color='orange')
+                axes[2].set_ylabel('Price ($/MWh)')
+                axes[2].set_title('Energy Price')
+                axes[2].set_xlabel('Time Step (5-min)')
+                axes[2].grid(True, alpha=0.3)
+                
+                # Save Plot
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"eval_step_{step}_{timestamp}.png"
+                save_path = os.path.join(plot_dir, filename)
+                plt.tight_layout()
+                plt.savefig(save_path)
+                plt.close(fig)
+                # print(f"Plot saved to {save_path}")
+                
+            except Exception as e:
+                print(f"Error plotting evaluation results: {e}")
+                import traceback
+                traceback.print_exc()
 
         if step % args.save_model_freq == 0:
             print("--------------------------------------------------------------------------------------------")

@@ -53,17 +53,70 @@ class DDRLTrainer(nn.Module):
         # 0. Initialize the hidden values
         self.reset() #  Reset the environment
         
-        # 1. rollout one episode
-        lmp,soc,action,profit = [],[],[],[]
+        # 1. Initialize logs container
+        logs = {
+            'lmp': [], 
+            'soc': [], 
+            'rt_action': [], 
+            'da_action': [], 
+            'reward': [],
+            'rev_da': [],
+            'rev_rt_deviation': [],
+            'rev_total': []
+        }
+        
+        # 2. rollout one episode
         for step in range(self.seq_len):
             info = self.one_minibatch_step(verbose=True)
-            lmp.append(info['lmp'])
-            soc.append(info['soc'])
-            action.append(info['action'])
-            profit.append(info['reward'])
+            
+            # Collect Time-Series Data (Concatenate along time axis later)
+            logs['lmp'].append(info['lmp'])
+            logs['soc'].append(info['soc'])
+            logs['rt_action'].append(info['action'])
+            logs['reward'].append(info['reward'])
+            
+            # Collect Daily Data (Stack along day axis later)
+            if 'da_action' in info:
+                logs['da_action'].append(info['da_action'])
+                
+            # Collect Financial Stats if available
+            if 'rev_da' in info:
+                logs['rev_da'].append(info['rev_da'])
+                logs['rev_rt_deviation'].append(info['rev_rt_deviation'])
+                logs['rev_total'].append(info['rev_total'])
 
-        # -1. return the reward of the episode (dummy)
-        return np.mean(profit)
+        # 3. Data Aggregation
+        results = {}
+        
+        # Concatenate time-series data (Total Steps = seq_len * 288)
+        # Shape: (Total_Steps, Batch, ...)
+        results['lmp'] = np.concatenate(logs['lmp'], axis=0)
+        results['soc'] = np.concatenate(logs['soc'], axis=0)
+        results['rt_action'] = np.concatenate(logs['rt_action'], axis=0)
+        results['reward'] = np.concatenate(logs['reward'], axis=0)
+        
+        # Stack daily data (Days = seq_len)
+        # Shape: (Days, Batch, 9, 24)
+        if logs['da_action']:
+            results['da_action'] = np.stack(logs['da_action'], axis=0)
+            
+        # Stack financial stats
+        # Shape: (Days, Batch, ...) or (Total_Steps, Batch, ...) depending on source
+        # Assuming these are daily or step-wise sums returned by info
+        if logs['rev_da']:
+             # Note: rev_da in info is likely (Batch, 9) or similar per step/day. 
+             # If it's per step, use concatenate. If per day, use stack.
+             # Based on MetaDataset logic, rev_da is calculated per step but accumulated? 
+             # Actually in MetaDataset it returns step-wise revenue. So concatenate.
+             results['rev_da'] = np.concatenate(logs['rev_da'], axis=0)
+             results['rev_rt_deviation'] = np.concatenate(logs['rev_rt_deviation'], axis=0)
+             results['rev_total'] = np.concatenate(logs['rev_total'], axis=0)
+
+        # Calculate Mean Profit for compatibility
+        results['mean_profit'] = np.mean(results['reward'])
+
+        # -1. return the full results dictionary
+        return results
 
     def save(self,save_pth_path):
         """
@@ -109,20 +162,44 @@ class LSTMTrainer(DDRLTrainer):
             nn.Linear(64,6),
         ).to(self.device)
 
-
-        self.mlp_decoder = nn.Sequential(
-            ClassWiseLinear(9,6+6+4+1,128),
+        # --- New Decoders for Two-Stage Settlement ---
+        
+        # 1. Day-Ahead Decoder (DA)
+        # Input: Long-term History (6) + Short-term History (6) = 12
+        # Output: 24 hours of actions for each market
+        self.da_decoder = nn.Sequential(
+            ClassWiseLinear(9, 6+6, 128),
             nn.ReLU(),
-            ClassWiseLinear(9,128,256),
-            nn.ReLU(),            
-            ClassWiseLinear(9,256,128),
+            ClassWiseLinear(9, 128, 128),
             nn.ReLU(),
-            ClassWiseLinear(9,128,1),
+            ClassWiseLinear(9, 128, 24), # Output 24 steps at once
             nn.Tanh(),
         ).to(self.device)
 
+        # 2. Real-Time Decoder (RT)
+        # Input: History (12) + Current Obs (4) + MCP (1) + DA Commitment (1) = 18
+        # Output: 1 action for current step
+        self.rt_decoder = nn.Sequential(
+            ClassWiseLinear(9, 6+6+4+1+1, 128),
+            nn.ReLU(),
+            ClassWiseLinear(9, 128, 256),
+            nn.ReLU(),            
+            ClassWiseLinear(9, 256, 128),
+            nn.ReLU(),
+            ClassWiseLinear(9, 128, 1),
+            nn.Tanh(),
+        ).to(self.device)
 
-        self.layers = nn.ModuleList([self.lstm_encoder1,self.lstm_encoder1_compress,self.lstm_encoder2,self.lstm_encoder2_compress,self.mlp_decoder])
+        # self.mlp_decoder = ... (Deprecated)
+
+        self.layers = nn.ModuleList([
+            self.lstm_encoder1,
+            self.lstm_encoder1_compress,
+            self.lstm_encoder2,
+            self.lstm_encoder2_compress,
+            self.da_decoder,
+            self.rt_decoder
+        ])
         self.optimizer = torch.optim.Adam(self.layers.parameters(), lr=learning_rate)    
 
 
@@ -132,10 +209,24 @@ class LSTMTrainer(DDRLTrainer):
         encoded_H,_= self.lstm_encoder1(H) # encoded_H.shape = (batch_size, 32)
         encoded_H = self.lstm_encoder1_compress(encoded_H[:,-1:,:]).repeat((1,9,1))
 
+        # --- New: Generate Day-Ahead Plan ---
+        # We need initial short-term history for DA planning
+        inday_hist_init = self.env.get_hour_inday_hist().swapaxes(-1,-2)
+        encoded_inday_hist_init,_ = self.lstm_encoder2(inday_hist_init)
+        encoded_inday_hist_init = self.lstm_encoder2_compress(encoded_inday_hist_init[:,-1:,:]).repeat((1,9,1))
+        
+        # DA Input: Long-term + Initial Short-term
+        da_input = torch.cat([encoded_H, encoded_inday_hist_init], dim=-1)
+        da_plan_24h = self.da_decoder(da_input) # Shape: (Batch, 9, 24)
+        # ------------------------------------
+
         # get action for each five minutes
         socs, rews, lmps, actions = [],[],[],[]
         for hour in range(24):
-            # encode indat hist hourly
+            # Get DA action for this hour
+            da_action_current_hour = da_plan_24h[:, :, hour] # Shape: (Batch, 9)
+
+            # encode inday hist hourly
             inday_hist = self.env.get_hour_inday_hist().swapaxes(-1,-2)
             encoded_inday_hist,_ = self.lstm_encoder2(inday_hist)
             encoded_inday_hist = self.lstm_encoder2_compress(encoded_inday_hist[:,-1:,:]).repeat((1,9,1))
@@ -144,36 +235,52 @@ class LSTMTrainer(DDRLTrainer):
             for t in range(12):
                 if not HDB: # Use NNSF for bidding
                     X = self.env.get_minibatch_obs()
-                    action_raw = self.mlp_decoder(torch.cat([encoded_H,
-                                                            encoded_inday_hist,
-                                                            X,
-                                                            known_soc.unsqueeze(1).repeat(1,9).unsqueeze(-1),
-                                                            mcp.unsqueeze(1).repeat(1,9).unsqueeze(-1)
-                                                            ],axis = -1)).squeeze(-1)
-                    # 2. update the soc, reward with the bidding actions
-                    action = self.env.get_action(action_raw,verbose_profit=verbose)
-                    action = torch.stack(action)
+                    
+                    # RT Input Construction
+                    rt_input = torch.cat([
+                        encoded_H,
+                        encoded_inday_hist,
+                        X,
+                        known_soc.unsqueeze(1).repeat(1,9).unsqueeze(-1),
+                        mcp.unsqueeze(1).repeat(1,9).unsqueeze(-1),
+                        da_action_current_hour.unsqueeze(-1)
+                    ], axis = -1)
+                    
+                    action_raw = self.rt_decoder(rt_input).squeeze(-1)
+                    action_rt = action_raw
+                    
                     mono_supply_curves, price_bids, power_bids = None, None, None
                 else: # Generate HDB for bidding
                     with torch.no_grad():
                         X = self.env.get_minibatch_obs_HDB()
-                        supply_curves = self.mlp_decoder(torch.cat([encoded_H.repeat(self.env.M,1,1),
-                                                                    encoded_inday_hist.repeat(self.env.M,1,1),
-                                                                    X,
-                                                                    known_soc.expand(self.env.M,9,1),
-                                                                    mcp.expand(self.env.M,9,1)
-                                                                    ],axis = -1)).squeeze(-1)
+                        
+                        # RT Input for HDB
+                        da_action_expanded = da_action_current_hour.unsqueeze(-1).expand(self.env.M, 9, 1)
+                        
+                        rt_input_hdb = torch.cat([
+                            encoded_H.repeat(self.env.M,1,1),
+                            encoded_inday_hist.repeat(self.env.M,1,1),
+                            X,
+                            known_soc.expand(self.env.M,9,1),
+                            mcp.expand(self.env.M,9,1),
+                            da_action_expanded
+                        ], axis = -1)
+
+                        supply_curves = self.rt_decoder(rt_input_hdb).squeeze(-1)
                         supply_curves = supply_curves.cpu().numpy()
                         supply_curves[:,1:] = supply_curves[:,1:]/2+0.5 # scale the supply curves in ancillary markets
                         mono_supply_curves = np.maximum.accumulate(supply_curves,axis = 0)
                         price_bids, power_bids = self.env.get_HDB(mono_supply_curves) # HDBs of shape (2,9,10) (price+power, markets, bids)
-                        action = self.env.get_action_hdb(price_bids, power_bids) # action tensor of shape (9,1)
-                        action = torch.tensor(action,device = self.device, dtype = torch.float32).reshape(9,1)
-                soc,rew,lmp,info = self.env.mini_batch_step(action,verbose_profit=verbose) # PC+1~
+                        action_rt_numpy = self.env.get_action_hdb(price_bids, power_bids) # action tensor of shape (9,1)
+                        action_rt = torch.tensor(action_rt_numpy, device = self.device, dtype = torch.float32).reshape(9,1)
+                
+                # Call environment with Two-Stage Settlement
+                soc,rew,lmp,info = self.env.mini_batch_step(action_rt, action_da=da_action_current_hour, verbose_profit=verbose) # PC+1~
+                
                 socs.append(soc)
                 rews.append(rew)
                 lmps.append(lmp)
-                actions.append(action)
+                actions.append(action_rt)
 
         # 4. return the key information of today the next_day observations for bidding
         if not verbose:
@@ -187,4 +294,5 @@ class LSTMTrainer(DDRLTrainer):
                 "mono_supply_curves": mono_supply_curves,
                 "price_bids": price_bids,
                 "power_bids": power_bids,
+                "da_action": da_plan_24h.detach().cpu().numpy()
                 }

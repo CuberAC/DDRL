@@ -10,7 +10,7 @@ pip install -e .
 To run the code, you can use the following command:
 
 ```bash
-python meta_bidding/train/ddrl/train.py --product energy regulation reserve --soc 4 --node NSW1
+python meta_bidding/train/ddrl/train.py --product energy regulation reserve --soc 4 --node NSW1 --total_epoches 20
 ```
 
 To test the trained agent, you can use the following command:
