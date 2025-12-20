@@ -157,39 +157,65 @@ if __name__ == "__main__":
                 rt_action = eval_results['rt_action'][:288, 0, :] # (288, 9)
                 soc = eval_results['soc'][:288, 0] # (288,)
                 lmp = eval_results['lmp'][:288, 0, :] # (288, 9)
-                lmp_da = eval_results['lmp_da'][:288, 0, :] # (288, 9)
                 
-                fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
-                
-                # Subplot 1: Actions (Energy Market)
-                axes[0].plot(rt_action[:, 0], label='RT Energy Action', color='blue')
-                
-                if 'da_action' in eval_results and eval_results['da_action'] is not None:
-                    da_action = eval_results['da_action'][0, 0, :, :] # (9, 24)
-                    # Repeat DA action to match 5-min resolution (24 -> 288)
-                    da_action_energy = np.repeat(da_action[0, :], 12)
-                    axes[0].plot(da_action_energy, label='DA Energy Plan', color='red', linestyle='--', alpha=0.7)
-                
-                axes[0].set_ylabel('Power (MW)')
-                axes[0].set_title(f'Actions (Step {step})')
-                axes[0].legend()
-                axes[0].grid(True, alpha=0.3)
+                # Check for DA Price
+                if 'lmp_da' in eval_results:
+                    lmp_da = eval_results['lmp_da'][:288, 0, :] # (288, 9)
+                else:
+                    lmp_da = None
 
-                # Subplot 2: SoC
-                axes[1].plot(soc, label='SoC', color='green')
-                axes[1].set_ylabel('SoC (0-1)')
-                axes[1].set_ylim(-0.1, 1.1)
-                axes[1].set_title('State of Charge')
-                axes[1].grid(True, alpha=0.3)
+                market_names = [
+                    'Energy (RRP)', 'Reg Raise', 'Reg Lower', 
+                    'Raise 6s', 'Raise 60s', 'Raise 5min', 
+                    'Lower 6s', 'Lower 60s', 'Lower 5min'
+                ]
+
+                # Create figure with 10 subplots (1 SoC + 9 Markets)
+                fig, axes = plt.subplots(10, 1, figsize=(12, 30), sharex=True)
                 
-                # Subplot 3: Price (Energy Market)
-                axes[2].plot(lmp[:, 0], label='RT Price', color='orange')
-                axes[2].plot(lmp_da[:, 0], label='DA Price', color='cyan', linestyle='--')
-                axes[2].set_ylabel('Price ($/MWh)')
-                axes[2].set_title('Energy Price')
-                axes[2].set_xlabel('Time Step (5-min)')
-                axes[2].legend()
-                axes[2].grid(True, alpha=0.3)
+                # Subplot 1: SoC
+                axes[0].plot(soc, label='SoC', color='green', linewidth=2)
+                axes[0].set_ylabel('SoC (0-1)')
+                axes[0].set_ylim(-0.1, 1.1)
+                axes[0].set_title('State of Charge')
+                axes[0].grid(True, alpha=0.3)
+                axes[0].legend(loc='upper right')
+
+                # Subplots 2-10: Markets
+                for i in range(9):
+                    ax = axes[i+1]
+                    market_name = market_names[i]
+                    
+                    # Plot Actions (Left Axis)
+                    ln1 = ax.plot(rt_action[:, i], label='RT Action', color='blue', alpha=0.8)
+                    
+                    ln2 = []
+                    if 'da_action' in eval_results and eval_results['da_action'] is not None:
+                        da_action = eval_results['da_action'][0, 0, :, :] # (9, 24)
+                        # Repeat DA action to match 5-min resolution (24 -> 288)
+                        da_action_market = np.repeat(da_action[i, :], 12)
+                        ln2 = ax.plot(da_action_market, label='DA Plan', color='red', linestyle='--', alpha=0.8)
+
+                    ax.set_ylabel('Power (MW)')
+                    ax.set_title(f'{market_name} Market')
+                    ax.grid(True, alpha=0.3)
+                    
+                    # Plot Price (Right Axis)
+                    ax2 = ax.twinx()
+                    ln3 = ax2.plot(lmp[:, i], label='RT Price', color='orange', alpha=0.6)
+                    
+                    ln4 = []
+                    if lmp_da is not None:
+                        ln4 = ax2.plot(lmp_da[:, i], label='DA Price', color='cyan', linestyle='--', alpha=0.6)
+
+                    ax2.set_ylabel('Price ($/MWh)')
+                    
+                    # Combined Legend
+                    lns = ln1 + ln2 + ln3 + ln4
+                    labs = [l.get_label() for l in lns]
+                    ax.legend(lns, labs, loc='upper left')
+
+                axes[-1].set_xlabel('Time Step (5-min)')
                 
                 # Save Plot
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -198,6 +224,12 @@ if __name__ == "__main__":
                 plt.tight_layout()
                 plt.savefig(save_path)
                 plt.close(fig)
+                # print(f"Plot saved to {save_path}")
+                
+            except Exception as e:
+                print(f"Error plotting evaluation results: {e}")
+                import traceback
+                traceback.print_exc()
                 print(f"Plot saved to {save_path}")
                 
             except Exception as e:
