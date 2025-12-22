@@ -169,7 +169,7 @@ class MetaDatasetAEMO(MetaDataset):
         self.encoder_lmp_shift = np.tile(np.arange(-288 * 4, 0), (self.num_agents, 1))
         self.encoder_fix_embedding = np.tile(np.eye(9), (self.num_agents, 1, 1))
 
-        self.decoder_lmp_shift = np.tile(0, (self.num_agents, 1))
+        self.decoder_lmp_shift = np.tile(-1, (self.num_agents, 1))
         # self.decoder_fix_embedding = np.tile(np.eye(9), (self.num_agents, 1, 1))
 
         # create observations of mean and std
@@ -427,7 +427,9 @@ class MetaDatasetAEMO(MetaDataset):
             energy_reward = energy_reward * energy_rew_discount
         
         # AS Markets
-        reward_market_revenue = energy_reward
+        # Collect revenues per market
+        # Energy (Index 0)
+        market_revenues = [energy_reward]
         
         # List of AS components for iteration
         as_rt = [regup_action_rt, regdown_action_rt, res6sup_action_rt, res60sup_action_rt, 
@@ -441,9 +443,12 @@ class MetaDatasetAEMO(MetaDataset):
 
         for i in range(8):
             # Market index i+1
-            reward_market_revenue += settlement(as_rt[i], as_da[i], lmps_rt[:,i+1], lmps_da[:,i+1])
+            rev_as = settlement(as_rt[i], as_da[i], lmps_rt[:,i+1], lmps_da[:,i+1])
+            market_revenues.append(rev_as)
 
-        reward_market_revenue = reward_market_revenue * self.MAXP
+        # Stack to (Batch, 9)
+        reward_market_revenue_per_market = torch.stack(market_revenues, dim=1) * self.MAXP
+        reward_market_revenue = torch.sum(reward_market_revenue_per_market, dim=1)
         
         # Degradation (RT)
         reward_degradation = - self.DEGRATIO*self.MAXP*(energy_action_rt*(energy_action_rt>0) + 0.25*regup_action_rt)
@@ -455,22 +460,31 @@ class MetaDatasetAEMO(MetaDataset):
         
         # --- Deviation Penalty ---
         reward_deviation_penalty = 0
+        reward_deviation_penalty_per_market = torch.zeros((self.num_agents, 9), device=self.device)
+
         if action_da is not None:
-            # 1. Penalty Rate: 1.5 * Mean RT Price (Global Mean)
-            penalty_rate = 1.5 * torch.tensor(self.price_mean.values, device=self.device, dtype=torch.float32)
+            # 1. Penalty Rate: 0.5 * Mean RT Price (Global Mean)
+            penalty_rate = 0.5 * torch.tensor(self.price_mean.values, device=self.device, dtype=torch.float32)
             
             # 2. Deviation Magnitude: |RT - DA|
             # Energy
-            deviation_abs = torch.abs(energy_action_rt - energy_action_da) * penalty_rate[0]
+            deviation_abs_list = [torch.abs(energy_action_rt - energy_action_da) * penalty_rate[0]]
+            
             # AS Markets
             for i in range(8):
-                deviation_abs += torch.abs(as_rt[i] - as_da[i]) * penalty_rate[i+1]
+                deviation_abs_list.append(torch.abs(as_rt[i] - as_da[i]) * penalty_rate[i+1])
+            
+            # Stack deviations
+            deviation_abs_per_market = torch.stack(deviation_abs_list, dim=1)
             
             # 3. Calculate Penalty (Negative Reward)
-            reward_deviation_penalty = -1.0 * deviation_abs * self.MAXP
+            reward_deviation_penalty_per_market = -1.0 * deviation_abs_per_market * self.MAXP
+            reward_deviation_penalty = torch.sum(reward_deviation_penalty_per_market, dim=1)
 
         if not verbose_profit: # Training
-            rew = reward_market_revenue + reward_degradation + reward_soc_violation + reward_deviation_penalty
+            #with penalty
+            #rew = reward_market_revenue + reward_degradation + reward_soc_violation + reward_deviation_penalty
+            rew = reward_market_revenue + reward_degradation + reward_soc_violation
         else: # testingp_max
             rew = reward_market_revenue + reward_degradation + reward_deviation_penalty
 
@@ -483,16 +497,21 @@ class MetaDatasetAEMO(MetaDataset):
                 'lmp_da': lmps_da_numpy,
             }
             if action_da is not None:
-                # Calculate DA Revenue for stats
-                rev_da = energy_action_da * lmps_da[:,0]
-                for i in range(8):
-                    rev_da += as_da[i] * lmps_da[:,i+1]
-                rev_da = rev_da * self.MAXP
+                # [Modified] Calculate DA Revenue per market (Batch, 9)
+                rev_da_energy = energy_action_da * lmps_da[:,0]
+                rev_da_as = torch.stack([as_da[i] * lmps_da[:,i+1] for i in range(8)], dim=1)
+                rev_da_matrix = torch.cat([rev_da_energy.unsqueeze(1), rev_da_as], dim=1) * self.MAXP
                 
-                info['rev_da'] = rev_da.cpu().numpy()
-                info['rev_total'] = reward_market_revenue.cpu().numpy()
-                info['rev_rt_deviation'] = info['rev_total'] - info['rev_da']
-                info['penalty_dev'] = reward_deviation_penalty.cpu().numpy()
+                # [Modified] Calculate Total Revenue per market (Batch, 9)
+                # reward_market_revenue_per_market is already (Batch, 9) and contains total revenue
+                
+                info['rev_da'] = rev_da_matrix.cpu().numpy() # Shape: (Batch, 9)
+                info['rev_total'] = reward_market_revenue_per_market.cpu().numpy() # Shape: (Batch, 9)
+                info['rev_rt_deviation'] = info['rev_total'] - info['rev_da'] # Shape: (Batch, 9)
+                info['penalty_dev'] = reward_deviation_penalty.cpu().numpy() # Shape: (Batch,)
+                
+                # Add per-market reward (Revenue + Penalty)
+                info['reward_per_market'] = (reward_market_revenue_per_market + reward_deviation_penalty_per_market).cpu().numpy()
 
         if not verbose_profit:
             return self._soc[-1],rew,lmps_rt_numpy, None

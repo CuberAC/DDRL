@@ -136,8 +136,10 @@ if __name__ == "__main__":
     for step in range(args.total_epoches):
         eps_rew = trainer.train_eps() 
 
-        wandb.log({"train_reward": np.clip(eps_rew,-10,np.inf)})
-        wandb.log({"batch_soc_violation": trainer.env.current_soc_violation_freq})
+        wandb.log({
+            "train_reward": np.clip(eps_rew,-10,np.inf),
+            "batch_soc_violation": trainer.env.current_soc_violation_freq
+        }, step=step)
         print("Episode : {} \t\t Timestep : {} \t\t Train Reward : {}".format(step, step*args.batch_size*args.eps_len, eps_rew))
         log_f.write('{},{},{}\n'.format(step, step*args.batch_size*args.eps_len, eps_rew))
         log_f.flush()
@@ -148,7 +150,18 @@ if __name__ == "__main__":
             
             # Extract mean profit for logging
             mean_profit = eval_results['mean_profit']
-            wandb.log({"eval_reward": np.clip(mean_profit,-10,np.inf)})
+            wandb.log({"eval_reward": np.clip(mean_profit,-10,np.inf)}, step=step)
+            
+            # Log per-market reward and penalty
+            if 'reward' in eval_results and eval_results['reward'].ndim > 2:
+                 avg_rew_per_mkt = np.mean(eval_results['reward'], axis=(0, 1))
+                 log_dict = {f"eval/reward_mkt_{i}": avg_rew_per_mkt[i] for i in range(9)}
+                 wandb.log(log_dict, step=step)
+            
+            if 'penalty_dev' in eval_results:
+                 avg_penalty = np.mean(eval_results['penalty_dev'])
+                 wandb.log({"eval/penalty_dev": avg_penalty}, step=step)
+
             print("Eval Reward : {}".format(mean_profit))
             
             # --- Plotting Logic ---
@@ -159,7 +172,7 @@ if __name__ == "__main__":
                 lmp = eval_results['lmp'][:288, 0, :] # (288, 9)
                 lmp_da = eval_results['lmp_da'][:288, 0, :] # (288, 9)
                 
-                fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
+                fig, axes = plt.subplots(6, 1, figsize=(14, 24), gridspec_kw={'height_ratios': [3, 3, 3, 3, 3, 1.5]})
                 
                 # Subplot 1: Actions (Energy Market)
                 axes[0].plot(rt_action[:, 0], label='RT Energy Action', color='blue')
@@ -190,6 +203,46 @@ if __name__ == "__main__":
                 axes[2].set_xlabel('Time Step (5-min)')
                 axes[2].legend()
                 axes[2].grid(True, alpha=0.3)
+                
+                # Prepare Revenue Data
+                if 'rev_da' in eval_results and 'rev_rt_deviation' in eval_results:
+                    # Sum over time for Agent 0
+                    day_rev_da = np.sum(eval_results['rev_da'][:288, 0, :], axis=0) # (9,)
+                    day_rev_rt_dev = np.sum(eval_results['rev_rt_deviation'][:288, 0, :], axis=0) # (9,)
+                    
+                    # Subplot 4: Energy Market Revenue (Stacked)
+                    bar_width = 0.3
+                    axes[3].bar(['Energy'], [day_rev_da[0]], width=bar_width, label='DA Revenue', color='crimson', alpha=0.6)
+                    axes[3].bar(['Energy'], [day_rev_rt_dev[0]], width=bar_width, bottom=[day_rev_da[0]], label='RT Deviation', color='royalblue', alpha=0.6)
+                    axes[3].set_title('Daily Revenue Breakdown (Energy Market)')
+                    axes[3].set_ylabel('Revenue ($)')
+                    axes[3].legend()
+                    axes[3].grid(True, alpha=0.3, axis='y')
+                    
+                    # Subplot 5: FCAS Revenue (Stacked)
+                    markets_as = ['Reg', '6s', '60s', '5min', 'Reg D', '6s D', '60s D', '5min D']
+                    x_as = np.arange(8)
+                    bar_width = 0.3
+                    axes[4].bar(x_as, day_rev_da[1:], label='DA Revenue', color='crimson', alpha=0.6)
+                    axes[4].bar(x_as, day_rev_rt_dev[1:], bottom=day_rev_da[1:], label='RT Deviation', color='royalblue', alpha=0.6)
+                    axes[4].set_xticks(x_as)
+                    axes[4].set_xticklabels(markets_as)
+                    axes[4].set_title('Daily Revenue Breakdown (Ancillary Services)')
+                    axes[4].set_ylabel('Revenue ($)')
+                    axes[4].legend()
+                    axes[4].grid(True, alpha=0.3, axis='y')
+                
+                # Subplot 6: Statistics
+                axes[5].axis('off')
+                stats_text = f"Mean Profit: {mean_profit:.2f}\n"
+                if 'rev_total' in eval_results:
+                    total_fcas_rev = np.sum(eval_results['rev_total'][:288, 0, 1:9])
+                    stats_text += f"FCAS Total Revenue: {total_fcas_rev:.2f}\n"
+                if 'penalty_dev' in eval_results:
+                    penalty_val = np.sum(eval_results['penalty_dev'][:288, 0])
+                    stats_text += f"Deviation Penalty: {penalty_val:.2f}\n"
+                
+                axes[5].text(0.1, 0.5, stats_text, fontsize=14, verticalalignment='center')
                 
                 # Save Plot
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

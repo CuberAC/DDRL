@@ -63,7 +63,8 @@ class DDRLTrainer(nn.Module):
             'reward': [],
             'rev_da': [],
             'rev_rt_deviation': [],
-            'rev_total': []
+            'rev_total': [],
+            'penalty_dev': []
         }
         
         # 2. rollout one episode
@@ -86,6 +87,8 @@ class DDRLTrainer(nn.Module):
                 logs['rev_da'].append(info['rev_da'])
                 logs['rev_rt_deviation'].append(info['rev_rt_deviation'])
                 logs['rev_total'].append(info['rev_total'])
+                if 'penalty_dev' in info:
+                    logs['penalty_dev'].append(info['penalty_dev'])
 
         # 3. Data Aggregation
         results = {}
@@ -114,6 +117,8 @@ class DDRLTrainer(nn.Module):
              results['rev_da'] = np.concatenate(logs['rev_da'], axis=0)
              results['rev_rt_deviation'] = np.concatenate(logs['rev_rt_deviation'], axis=0)
              results['rev_total'] = np.concatenate(logs['rev_total'], axis=0)
+             if logs['penalty_dev']:
+                 results['penalty_dev'] = np.concatenate(logs['penalty_dev'], axis=0)
 
         # Calculate Mean Profit for compatibility
         results['mean_profit'] = np.mean(results['reward'])
@@ -226,6 +231,8 @@ class LSTMTrainer(DDRLTrainer):
         # get action for each five minutes
         socs, rews, lmps, actions = [],[],[],[]
         lmps_da = []
+        rewards_per_market = []
+        rev_das, rev_totals, penalty_devs, rev_rt_deviations = [], [], [], []
         for hour in range(24):
             # Get DA action for this hour
             da_action_current_hour = da_plan_24h[:, :, hour] # Shape: (Batch, 9)
@@ -287,12 +294,20 @@ class LSTMTrainer(DDRLTrainer):
                 actions.append(action_rt)
                 if verbose:
                     lmps_da.append(info['lmp_da'])
+                    if 'reward_per_market' in info:
+                        rewards_per_market.append(info['reward_per_market'])
+                    if 'rev_da' in info:
+                        rev_das.append(info['rev_da'])
+                        rev_totals.append(info['rev_total'])
+                        penalty_devs.append(info['penalty_dev'])
+                        if 'rev_rt_deviation' in info:
+                            rev_rt_deviations.append(info['rev_rt_deviation'])
 
         # 4. return the key information of today the next_day observations for bidding
         if not verbose:
             return rews 
         else:
-            return {
+            ret = {
                 'lmp':np.stack(lmps, axis=0),
                 'lmp_da':np.stack(lmps_da, axis=0),
                 'soc': torch.stack(socs).cpu().numpy(),
@@ -303,3 +318,14 @@ class LSTMTrainer(DDRLTrainer):
                 "power_bids": power_bids,
                 "da_action": da_plan_24h.detach().cpu().numpy()
                 }
+            if len(rewards_per_market) > 0:
+                ret['reward'] = np.stack(rewards_per_market, axis=0)
+            if len(rev_das) > 0:
+                ret['rev_da'] = np.stack(rev_das, axis=0)
+                ret['rev_total'] = np.stack(rev_totals, axis=0)
+                ret['penalty_dev'] = np.stack(penalty_devs, axis=0)
+                if len(rev_rt_deviations) > 0:
+                    ret['rev_rt_deviation'] = np.stack(rev_rt_deviations, axis=0)
+                else:
+                    ret['rev_rt_deviation'] = ret['rev_total'] - ret['rev_da']
+            return ret
