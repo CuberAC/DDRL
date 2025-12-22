@@ -110,7 +110,18 @@ def plot_results(results, output_dir):
         reward = results['reward'][:steps, batch_idx]
     
     # 创建图表
-    fig, axes = plt.subplots(5, 1, figsize=(12, 20), sharex=True)
+    # 移除 sharex=True，因为最后一个子图是条形图，x轴不同
+    fig, axes = plt.subplots(5, 1, figsize=(12, 20))
+    
+    # 手动设置前4个子图共享x轴
+    axes[1].sharex(axes[0])
+    axes[2].sharex(axes[0])
+    axes[3].sharex(axes[0])
+    
+    # 隐藏前3个子图的x轴标签
+    plt.setp(axes[0].get_xticklabels(), visible=False)
+    plt.setp(axes[1].get_xticklabels(), visible=False)
+    plt.setp(axes[2].get_xticklabels(), visible=False)
     
     # 1. Actions (Energy)
     axes[0].plot(rt_action[:, 0], label='RT Energy Action', color='blue')
@@ -144,21 +155,65 @@ def plot_results(results, output_dir):
     axes[3].plot(cum_reward, label='Cumulative Reward', color='purple')
     axes[3].set_ylabel('Reward ($)')
     axes[3].set_title('Cumulative Reward')
+    axes[3].set_xlabel('Time Step (5-min)') # 添加x轴标签
     axes[3].grid(True, alpha=0.3)
 
-    # 5. FCAS Actions (Reg Up/Down)
-    axes[4].plot(rt_action[:, 1], label='Reg Up', alpha=0.7)
-    axes[4].plot(rt_action[:, 2], label='Reg Down', alpha=0.7)
-    axes[4].set_ylabel('Power (MW)')
-    axes[4].set_title('FCAS Regulation Actions')
-    axes[4].legend()
-    axes[4].grid(True, alpha=0.3)
-    axes[4].set_xlabel('Time Step (5-min)')
+    # 5. Revenue Breakdown (Stacked Bar Chart)
+    # 计算各市场的收益
+    # rev_da: (Total_Steps, Batch, 9) -> Sum over steps -> (9,)
+    # rev_rt_deviation: (Total_Steps, Batch, 9) -> Sum over steps -> (9,)
+    
+    if 'rev_da' in results and 'rev_rt_deviation' in results:
+        # 确保维度正确，如果是 (Total_Steps, Batch, 9)
+        if results['rev_da'].ndim == 3:
+            day_rev_da = np.sum(results['rev_da'][:steps, batch_idx, :], axis=0)
+            day_rev_rt_dev = np.sum(results['rev_rt_deviation'][:steps, batch_idx, :], axis=0)
+        else:
+            # 可能是 (Days, Batch, 9)
+            day_rev_da = results['rev_da'][0, batch_idx, :]
+            day_rev_rt_dev = results['rev_rt_deviation'][0, batch_idx, :]
+
+        markets = ['Energy', 'Reg', 'Reg D', '6s', '60s', '5min', '6s D', '60s D', '5min D']
+        # 注意：MetaDataset 中市场顺序可能略有不同，这里假设顺序为：
+        # 0: Energy
+        # 1: Reg Up, 2: Reg Down
+        # 3: 6s Up, 4: 60s Up, 5: 5min Up
+        # 6: 6s Down, 7: 60s Down, 8: 5min Down
+        # 对应的标签需要调整以匹配索引
+        market_labels = ['Energy', 'Reg Up', 'Reg Dn', '6s Up', '60s Up', '5m Up', '6s Dn', '60s Dn', '5m Dn']
+        
+        x = np.arange(len(market_labels))
+        width = 0.6
+
+        p1 = axes[4].bar(x, day_rev_da, width, label='DA Revenue', color='crimson', alpha=0.7)
+        p2 = axes[4].bar(x, day_rev_rt_dev, width, bottom=day_rev_da, label='RT Deviation', color='royalblue', alpha=0.7)
+
+        axes[4].set_ylabel('Revenue ($)')
+        axes[4].set_title('Daily Revenue Breakdown by Market')
+        axes[4].set_xticks(x)
+        axes[4].set_xticklabels(market_labels)
+        axes[4].legend()
+        axes[4].grid(True, alpha=0.3, axis='y')
+        
+        # 计算总收益
+        total_revenue = np.sum(day_rev_da + day_rev_rt_dev)
+        
+        # 在图表上方添加总收益文本
+        axes[4].text(0.5, 1.15, f"Total Daily Revenue: ${total_revenue:.2f}", 
+                     transform=axes[4].transAxes, ha='center', fontsize=12, fontweight='bold',
+                     bbox=dict(facecolor='white', alpha=0.8, edgecolor='gray'))
+
+    else:
+        axes[4].text(0.5, 0.5, "Revenue data not available", ha='center', va='center')
+        print("Warning: 'rev_da' or 'rev_rt_deviation' not found in results.")
 
     plt.tight_layout()
     save_path = os.path.join(output_dir, "daily_performance.png")
     plt.savefig(save_path)
     print(f"Plot saved to {save_path}")
+    
+    if 'rev_da' in results and 'rev_rt_deviation' in results:
+        print(f"Total Daily Revenue: ${total_revenue:.2f}")
 
 if __name__ == "__main__":
     main()
