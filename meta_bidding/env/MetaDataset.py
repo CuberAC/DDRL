@@ -60,21 +60,28 @@ class MetaDatasetAEMO(MetaDataset):
     def parse_data(self,env_config):
 
         data_paths = {
-            "train": "meta_bidding/data/aemo_data/aemo_price_train_dual.pkl",
-            "test": "meta_bidding/data/aemo_data/aemo_price_test_dual.pkl",
+            "train": "meta_bidding/data/pjm_data/pjm_price_train_dual.pkl",
+            "test": "meta_bidding/data/pjm_data/pjm_price_test_dual.pkl",
         }
-
-        self.market_keys_rt = [
-            'RRP',
-            'RAISEREGRRP',
-            'LOWERREGRRP',
-            'RAISE6SECRRP',
-            'RAISE60SECRRP',
-            'RAISE5MINRRP',
-            'LOWER6SECRRP',
-            'LOWER60SECRRP',
-            'LOWER5MINRRP',
-        ]
+        
+        # Determine number of markets (Default: 9)
+        # self.num_markets = env_config.get('num_markets', 9) # Deprecated, infer from product
+        self.market_keys_rt = []
+        if 'energy' in env_config['product']:
+            self.market_keys_rt.append('RRP')
+        if 'regulation' in env_config['product']:
+            self.market_keys_rt.extend(['RAISEREGRRP', 'LOWERREGRRP'])
+        if 'reserve' in env_config['product']:
+             self.market_keys_rt.extend([
+                'RAISE6SECRRP',
+                'RAISE60SECRRP',
+                'RAISE5MINRRP',
+                'LOWER6SECRRP',
+                'LOWER60SECRRP',
+                'LOWER5MINRRP'
+             ])
+        
+        self.num_markets = len(self.market_keys_rt)
         self.market_keys_da = ['DA_' + key for key in self.market_keys_rt]
         self.market_keys = self.market_keys_rt # Compatibility
 
@@ -155,7 +162,8 @@ class MetaDatasetAEMO(MetaDataset):
         #         np.linspace(100,400,self.M//4),
         #     ]
         # ).reshape(-1,1).repeat(8,axis = 1)
-        self.price_range[:,1:] = np.linspace(-0.1,50,self.M).reshape(-1,1).repeat(8,axis = 1)
+        if self.num_markets > 1:
+            self.price_range[:,1:] = np.linspace(-0.1,50,self.M).reshape(-1,1).repeat(self.num_markets-1,axis = 1)
 
         self.price_range_normalized = (self.price_range-self.price_mean.to_numpy())/self.price_std.to_numpy()
 
@@ -167,14 +175,14 @@ class MetaDatasetAEMO(MetaDataset):
 
         # create indexes fro inputs
         self.encoder_lmp_shift = np.tile(np.arange(-288 * 4, 0), (self.num_agents, 1))
-        self.encoder_fix_embedding = np.tile(np.eye(9), (self.num_agents, 1, 1))
+        self.encoder_fix_embedding = np.tile(np.eye(self.num_markets), (self.num_agents, 1, 1))
 
         self.decoder_lmp_shift = np.tile(-1, (self.num_agents, 1))
         # self.decoder_fix_embedding = np.tile(np.eye(9), (self.num_agents, 1, 1))
 
         # create observations of mean and std
-        self.hour_price_mean = self._lmp_normalized.reshape(-1,12,9).mean(axis = 1)
-        self.hour_price_std = self._lmp_normalized.reshape(-1,12,9).std(axis = 1)
+        self.hour_price_mean = self._lmp_normalized.reshape(-1,12,self.num_markets).mean(axis = 1)
+        self.hour_price_std = self._lmp_normalized.reshape(-1,12,self.num_markets).std(axis = 1)
         self.hour_hist_idx_from_pc = lambda pc: (pc/12).astype(int)[:,None] + np.arange(-24*4,0)[None,:]
         self.hour_inday_hist_idx_from_pc = lambda pc: (pc//12).astype(int)[:,None] + np.arange(-6,0)[None,:] # filter the last 6 hours of the day
  
@@ -187,7 +195,7 @@ class MetaDatasetAEMO(MetaDataset):
         # compute the positional encoding
         self.positional_encoding_timeofday = np.array([np.sin(timeofday_seconds), np.cos(timeofday_seconds)]).T
         
-        self.timeofday_shift = np.zeros((self.num_agents,9),dtype = np.int64)
+        self.timeofday_shift = np.zeros((self.num_agents,self.num_markets),dtype = np.int64)
 
         # Construct the the Start Of Day index lists
         self.sod_idx = np.where((timeofday_seconds==0).values)[0]
@@ -256,6 +264,10 @@ class MetaDatasetAEMO(MetaDataset):
         # Clip Energy Actiong to valid value in testing
         if verbose_profit: 
             energy_action  = torch.clamp(energy_action,-(1-self._soc[-1])/self.MAXPRTRATIO/self.EFFICIENCY,self._soc[-1]/self.MAXPRTRATIO*self.EFFICIENCY)
+
+        if self.num_markets == 1:
+            zeros = torch.zeros_like(energy_action)
+            return energy_action, zeros, zeros, zeros, zeros, zeros, zeros, zeros, zeros
 
         actions01 = self._11201(actions)
         regup_action  =  actions01[:,1].clip(None,p_max-energy_action) * self.regulation_market_valid
@@ -443,7 +455,10 @@ class MetaDatasetAEMO(MetaDataset):
 
         for i in range(8):
             # Market index i+1
-            rev_as = settlement(as_rt[i], as_da[i], lmps_rt[:,i+1], lmps_da[:,i+1])
+            if i + 1 < self.num_markets:
+                rev_as = settlement(as_rt[i], as_da[i], lmps_rt[:,i+1], lmps_da[:,i+1])
+            else:
+                rev_as = torch.zeros_like(lmps_rt[:,0])
             market_revenues.append(rev_as)
 
         # Stack to (Batch, 9)
@@ -458,35 +473,10 @@ class MetaDatasetAEMO(MetaDataset):
                                     - (50/self.beta**2) * (new_soc - self.beta)**2 * (new_soc<(self.beta))
         reward_soc_violation = reward_soc_equivalent_price * self.MAXP
         
-        # --- Deviation Penalty ---
-        reward_deviation_penalty = 0
-        reward_deviation_penalty_per_market = torch.zeros((self.num_agents, 9), device=self.device)
-
-        if action_da is not None:
-            # 1. Penalty Rate: 0.5 * Mean RT Price (Global Mean)
-            penalty_rate = 0.5 * torch.tensor(self.price_mean.values, device=self.device, dtype=torch.float32)
-            
-            # 2. Deviation Magnitude: |RT - DA|
-            # Energy
-            deviation_abs_list = [torch.abs(energy_action_rt - energy_action_da) * penalty_rate[0]]
-            
-            # AS Markets
-            for i in range(8):
-                deviation_abs_list.append(torch.abs(as_rt[i] - as_da[i]) * penalty_rate[i+1])
-            
-            # Stack deviations
-            deviation_abs_per_market = torch.stack(deviation_abs_list, dim=1)
-            
-            # 3. Calculate Penalty (Negative Reward)
-            reward_deviation_penalty_per_market = -1.0 * deviation_abs_per_market * self.MAXP
-            reward_deviation_penalty = torch.sum(reward_deviation_penalty_per_market, dim=1)
-
         if not verbose_profit: # Training
-            #with penalty
-            #rew = reward_market_revenue + reward_degradation + reward_soc_violation + reward_deviation_penalty
             rew = reward_market_revenue + reward_degradation + reward_soc_violation
         else: # testingp_max
-            rew = reward_market_revenue + reward_degradation + reward_deviation_penalty
+            rew = reward_market_revenue + reward_degradation
 
         self._pcs = (self._pcs+1)%self.dataset_size
 
@@ -499,7 +489,15 @@ class MetaDatasetAEMO(MetaDataset):
             if action_da is not None:
                 # [Modified] Calculate DA Revenue per market (Batch, 9)
                 rev_da_energy = energy_action_da * lmps_da[:,0]
-                rev_da_as = torch.stack([as_da[i] * lmps_da[:,i+1] for i in range(8)], dim=1)
+                
+                rev_da_as_list = []
+                for i in range(8):
+                    if i + 1 < self.num_markets:
+                        rev_da_as_list.append(as_da[i] * lmps_da[:,i+1])
+                    else:
+                        rev_da_as_list.append(torch.zeros_like(rev_da_energy))
+                
+                rev_da_as = torch.stack(rev_da_as_list, dim=1)
                 rev_da_matrix = torch.cat([rev_da_energy.unsqueeze(1), rev_da_as], dim=1) * self.MAXP
                 
                 # [Modified] Calculate Total Revenue per market (Batch, 9)
@@ -508,10 +506,9 @@ class MetaDatasetAEMO(MetaDataset):
                 info['rev_da'] = rev_da_matrix.cpu().numpy() # Shape: (Batch, 9)
                 info['rev_total'] = reward_market_revenue_per_market.cpu().numpy() # Shape: (Batch, 9)
                 info['rev_rt_deviation'] = info['rev_total'] - info['rev_da'] # Shape: (Batch, 9)
-                info['penalty_dev'] = reward_deviation_penalty.cpu().numpy() # Shape: (Batch,)
                 
-                # Add per-market reward (Revenue + Penalty)
-                info['reward_per_market'] = (reward_market_revenue_per_market + reward_deviation_penalty_per_market).cpu().numpy()
+                # Add per-market reward (Revenue)
+                info['reward_per_market'] = (reward_market_revenue_per_market).cpu().numpy()
 
         if not verbose_profit:
             return self._soc[-1],rew,lmps_rt_numpy, None

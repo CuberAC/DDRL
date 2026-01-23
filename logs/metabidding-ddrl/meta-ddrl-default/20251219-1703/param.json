@@ -1,1 +1,0 @@
-{"cuda": 0, "env_name": "metabidding-ddrl", "exp_name": "meta-ddrl-default", "batch_size": 128, "total_epoches": 20, "eps_len": 4, "save_model_freq": 50, "lr": 0.001, "random_seed": 0, "eval_freq": 10, "trainer": "lstm", "data_source": "train", "product": ["energy", "regulation", "reserve"], "soc": 4.0, "node": ["NSW1"], "checkpoint": null}

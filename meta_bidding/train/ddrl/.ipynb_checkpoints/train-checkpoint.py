@@ -29,19 +29,12 @@ parser.add_argument("--iso",default=argparse.SUPPRESS,type=str,help="PJM, CAISO,
 # multi select choice: energy regulation reserve
 parser.add_argument('--product',choices=['energy', 'regulation', 'reserve'],default=['energy', 'regulation', 'reserve'],nargs='+',help='Choose the market')
 parser.add_argument("--soc",default=4,type=float,help="The fixed soc hour of the energy storage")
-parser.add_argument('--node',choices=['AECO'],default=['AECO'],nargs='+',help='Choose the node')
+parser.add_argument('--node',choices=['NSW1', 'QLD1', 'SA1', 'TAS1', 'VIC1'],default=['NSW1', 'QLD1', 'SA1', 'TAS1', 'VIC1'],nargs='+',help='Choose the node')
 
 parser.add_argument("--checkpoint",default=None,type=str,help="checkpoint path")
 
 
 args = parser.parse_args()
-
-# [Modified] Infer num_markets from product
-args.num_markets = 0
-if 'energy' in args.product: args.num_markets += 1
-if 'regulation' in args.product: args.num_markets += 2
-if 'reserve' in args.product: args.num_markets += 6
-
 ################################### Training ###################################
 print("============================================================================================")
 device = torch.device("cuda:"+str(args.cuda))
@@ -159,12 +152,16 @@ if __name__ == "__main__":
             mean_profit = eval_results['mean_profit']
             wandb.log({"eval_reward": np.clip(mean_profit,-10,np.inf)}, step=step)
             
-            # Log per-market reward
+            # Log per-market reward and penalty
             if 'reward' in eval_results and eval_results['reward'].ndim > 2:
                  avg_rew_per_mkt = np.mean(eval_results['reward'], axis=(0, 1))
                  log_dict = {f"eval/reward_mkt_{i}": avg_rew_per_mkt[i] for i in range(9)}
                  wandb.log(log_dict, step=step)
             
+            if 'penalty_dev' in eval_results:
+                 avg_penalty = np.mean(eval_results['penalty_dev'])
+                 wandb.log({"eval/penalty_dev": avg_penalty}, step=step)
+
             print("Eval Reward : {}".format(mean_profit))
             
             # --- Plotting Logic ---
@@ -175,7 +172,7 @@ if __name__ == "__main__":
                 lmp = eval_results['lmp'][:288, 0, :] # (288, 9)
                 lmp_da = eval_results['lmp_da'][:288, 0, :] # (288, 9)
                 
-                fig, axes = plt.subplots(5, 1, figsize=(14, 22), gridspec_kw={'height_ratios': [3, 3, 3, 3, 1.5]})
+                fig, axes = plt.subplots(6, 1, figsize=(14, 24), gridspec_kw={'height_ratios': [3, 3, 3, 3, 3, 1.5]})
                 
                 # Subplot 1: Actions (Energy Market)
                 axes[0].plot(rt_action[:, 0], label='RT Energy Action', color='blue')
@@ -221,11 +218,31 @@ if __name__ == "__main__":
                     axes[3].set_ylabel('Revenue ($)')
                     axes[3].legend()
                     axes[3].grid(True, alpha=0.3, axis='y')
+                    
+                    # Subplot 5: FCAS Revenue (Stacked)
+                    markets_as = ['Reg', '6s', '60s', '5min', 'Reg D', '6s D', '60s D', '5min D']
+                    x_as = np.arange(8)
+                    bar_width = 0.3
+                    axes[4].bar(x_as, day_rev_da[1:], label='DA Revenue', color='crimson', alpha=0.6)
+                    axes[4].bar(x_as, day_rev_rt_dev[1:], bottom=day_rev_da[1:], label='RT Deviation', color='royalblue', alpha=0.6)
+                    axes[4].set_xticks(x_as)
+                    axes[4].set_xticklabels(markets_as)
+                    axes[4].set_title('Daily Revenue Breakdown (Ancillary Services)')
+                    axes[4].set_ylabel('Revenue ($)')
+                    axes[4].legend()
+                    axes[4].grid(True, alpha=0.3, axis='y')
                 
-                # Subplot 5: Statistics
-                axes[4].axis('off')
+                # Subplot 6: Statistics
+                axes[5].axis('off')
                 stats_text = f"Mean Profit: {mean_profit:.2f}\n"
-                axes[4].text(0.1, 0.5, stats_text, fontsize=14, verticalalignment='center')
+                if 'rev_total' in eval_results:
+                    total_fcas_rev = np.sum(eval_results['rev_total'][:288, 0, 1:9])
+                    stats_text += f"FCAS Total Revenue: {total_fcas_rev:.2f}\n"
+                if 'penalty_dev' in eval_results:
+                    penalty_val = np.sum(eval_results['penalty_dev'][:288, 0])
+                    stats_text += f"Deviation Penalty: {penalty_val:.2f}\n"
+                
+                axes[5].text(0.1, 0.5, stats_text, fontsize=14, verticalalignment='center')
                 
                 # Save Plot
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
