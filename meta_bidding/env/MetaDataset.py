@@ -59,9 +59,10 @@ class MetaDatasetAEMO(MetaDataset):
 
     def parse_data(self,env_config):
 
+        # Updated paths to use the newly split datasets
         data_paths = {
-            "train": "meta_bidding/data/pjm_data/pjm_price_train_dual.pkl",
-            "test": "meta_bidding/data/pjm_data/pjm_price_test_dual.pkl",
+            "train": "meta_bidding/data/pjm_data/pjm_price_train_dual_split.pkl",
+            "test": "meta_bidding/data/pjm_data/pjm_price_test_dual_split.pkl",
         }
         
         # Determine number of markets (Default: 9)
@@ -228,7 +229,8 @@ class MetaDatasetAEMO(MetaDataset):
         shape = (self.num_agents,)
         # https://www.nrel.gov/docs/fy23osti/85878.pdf 大部分BESS是4hr
         self.MAXSOC = np.random.uniform(low=self.env_config['soc'], high=self.env_config['soc'], size=shape) if MAXSOC is None else np.array(MAXSOC).reshape(-1)# x MWH
-        self.DEGRATIO = np.random.uniform(low=50, high=50, size=shape) if DEGRATIO is None else np.array(DEGRATIO).reshape(-1) # $/MWH-cycle
+        deg_cost = self.env_config.get('degradation_cost', 50.0)
+        self.DEGRATIO = np.random.uniform(low=deg_cost, high=deg_cost, size=shape) if DEGRATIO is None else np.array(DEGRATIO).reshape(-1) # $/MWH-cycle
         self.EFFICIENCY = np.random.uniform(low=np.sqrt(0.9), high=np.sqrt(0.9), size=shape) if EFFICIENCY is None else np.array(EFFICIENCY).reshape(-1)# single direction efficiency
         self.MAXPRTRATIO = self.MAXP/(self.MAXSOC)/12.# percentage can be changed in SoC with Maximun Power(without considering efficiency)
         self.PARAMS = np.stack([self.MAXSOC/10.,self.DEGRATIO/10.,self.EFFICIENCY,self.MAXPRTRATIO]).T

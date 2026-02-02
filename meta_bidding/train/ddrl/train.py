@@ -21,7 +21,7 @@ parser.add_argument("--eps_len",default=4,type=int,help="episode length in each 
 parser.add_argument("--save_model_freq",default=50,help="save model frequency (in num epoches)")
 parser.add_argument("--lr",default=1e-3,type=float,help="learning rate for network")
 parser.add_argument("--random_seed",default=0,type=float,help="set random seed if required (0 = no random seed)")
-parser.add_argument("--eval_freq",default=10,type=int,help="evaluation frequency (in num epoches)")
+parser.add_argument("--eval_freq",default=100,type=int,help="evaluation frequency (in num epoches)")
 
 parser.add_argument("--trainer", default="lstm",type=str, help="mlp, rnn, cnn, transformer")
 parser.add_argument("--data_source",default="train",type=str,help="train, 2021, 2020")
@@ -29,6 +29,7 @@ parser.add_argument("--iso",default=argparse.SUPPRESS,type=str,help="PJM, CAISO,
 # multi select choice: energy regulation reserve
 parser.add_argument('--product',choices=['energy', 'regulation', 'reserve'],default=['energy', 'regulation', 'reserve'],nargs='+',help='Choose the market')
 parser.add_argument("--soc",default=4,type=float,help="The fixed soc hour of the energy storage")
+parser.add_argument("--degradation_cost",default=50.0,type=float,help="Battery degradation cost ($/MWH-cycle)")
 parser.add_argument('--node',choices=['AECO'],default=['AECO'],nargs='+',help='Choose the node')
 
 parser.add_argument("--checkpoint",default=None,type=str,help="checkpoint path")

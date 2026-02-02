@@ -2,270 +2,221 @@ import numpy as np
 import pandas as pd
 import gurobipy as gp
 from gurobipy import GRB
-import os
 import argparse
 import matplotlib.pyplot as plt
+
+# 设置 Matplotlib 后端，避免在无显示器环境下报错
+plt.switch_backend('Agg')
 
 def solve_optimal_bidding(
     price_data_path, 
     node='AECO', 
-    soc_max_mwh=4.0, 
+    soc_max_mwh=1.0, 
     power_max_mw=1.0, 
-    efficiency=0.9, # Round trip efficiency sqrt(0.9)*sqrt(0.9) = 0.9? Code uses sqrt(0.9) for single trip
-    degradation_cost=50.0, # $/MWh-cycle (approx)
+    efficiency=0.9, 
+    degradation_cost=0, 
     initial_soc=0.5,
-    horizon_hours=24,
-    product=['energy']
+    horizon_hours=24
 ):
     """
-    Solves the optimal bidding strategy with perfect foresight using Gurobi.
+    使用 Gurobi 求解基于完美价格预测的最优日前和实时投标策略。
+    包括收益分解计算和绘图功能。
     """
-    print(f"Loading data from {price_data_path}...")
+    print(f"正在加载数据: {price_data_path}...")
     try:
         df = pd.read_pickle(price_data_path)
     except Exception as e:
-        print(f"Error loading data: {e}")
+        print(f"数据加载失败: {e}")
         return
 
-    # Filter by node if present
+    # 按节点筛选数据
     if 'REGIONID' in df.columns and node:
         df = df[df['REGIONID'] == node]
-        print(f"Filtered data for node {node}. Rows: {len(df)}")
+        print(f"已筛选节点 {node} 的数据，共 {len(df)} 行。")
     
     if len(df) == 0:
-        print("No data found.")
+        print("未找到数据。")
         return
 
-    # Constants
-    dt = 5.0 / 60.0 # 5 minutes in hours
-    T = int(horizon_hours * 60 / 5) # Time steps
+    # 时间参数
+    dt = 5.0 / 60.0 # 5分钟对应的小时数
+    dt_steps_per_hour = 12
+    T = int(horizon_hours * dt_steps_per_hour) # 总时间步数
     
-    # Slice first day/horizon for demonstration
-    # In a real scenario, this would loop over days or be a rolling horizon
-    # For "standard answer", we probably want to solve for a specific period used in evaluation.
-    # Let's verify data structure first.
-    # The file contains 5-min intervals.
+    # 截取前 T 个时间步的数据 (原始 5min)
+    # 为了适应 Gurobi 限制版 License (2000 变量限制), 我们将数据重采样到 15 分钟间隔
+    # T_raw = horizon 24h * 12 = 288
+    # T_new = horizon 24h * 4 = 96
     
-    # We will pick the first T steps
-    df_slice = df.iloc[:T].copy().reset_index(drop=True)
+    # 原始切片
+    df_raw = df.iloc[:int(horizon_hours * 12)].copy().reset_index(drop=True)
     
-    # Extract prices
-    # RT Prices
-    rt_prices = {}
-    da_prices = {}
+    # 重采样处理
+    # 假设数据索引是连续的 5min, 我们可以每 3 行取平均
+    resample_factor = 3 # 5min -> 15min
     
-    # Market map based on MetaDataset logic
-    # Energy
-    rt_prices['energy'] = df_slice['RRP'].values
-    da_prices['energy'] = df_slice['DA_RRP'].values
+    # 提取并重采样价格
+    # 注意: RRP 和 DA_RRP 是时段价格, 取平均是合理的
+    rt_prices_raw = df_raw['RRP'].values
+    da_prices_raw = df_raw['DA_RRP'].values
     
-    # Regulation
-    # Note: Reg prices in PJM data seem to be capacity prices? Or movement?
-    # MetaDataset uses: (0.25*regup_action_rt*lmps_rt[:,0] - 0.25*regdown_action_rt*lmps_rt[:,0]) implies Energy adjustment?
-    # Wait, MetaDataset logic for Reg (AS) revenue:
-    # settlement(as_rt[i], as_da[i], lmps_rt[:,i+1], lmps_da[:,i+1])
-    # The AS prices are in columns like 'RAISEREGRRP', etc.
+    # Reshape and mean
+    # 确保长度能被 3 整除
+    trim_len = (len(rt_prices_raw) // resample_factor) * resample_factor
+    rt_prices = rt_prices_raw[:trim_len].reshape(-1, resample_factor).mean(axis=1)
+    da_prices = da_prices_raw[:trim_len].reshape(-1, resample_factor).mean(axis=1)
     
-    # Let's map markets if requested
-    use_reg = 'regulation' in product
-    use_res = 'reserve' in product
+    # 更新时间参数
+    dt = (5.0 * resample_factor) / 60.0 # 15分钟 = 0.25 小时
+    T = len(rt_prices)
     
-    # Efficiency params
-    eff_single = np.sqrt(efficiency) # 0.948
+    print(f"数据已重采样为 {dt*60:.0f} 分钟间隔, 时间步数: {T}")
     
-    # Create Gurobi Model
+    # 效率参数转换为单程效率: sqrt(0.9) approx 0.948
+    eff_single = np.sqrt(efficiency) 
+    
+    # 创建 Gurobi 模型
     m = gp.Model("OptimalBidding")
-    m.setParam('OutputFlag', 1)
+    m.setParam('OutputFlag', 0) # 关闭冗余输出，仅显示最终结果
 
-    # Variables
-    # q_da: Day-Ahead Commitment (MW)
-    # q_rt: Real-Time Dispatch (MW) matches the actual physical flow? 
-    # In settlement formulation: Rev = Q_da * P_da + (Q_rt - Q_da) * P_rt
-    # Where Q_rt is what actually happens physically.
-    
-    # Markets:
-    # 0: Energy (Positive = Discharge, Negative = Charge)
-    # 1: Reg Up
-    # 2: Reg Down
-    # ... Reserves
-    
-    # We simplify to Energy for now as base, add others if needed.
-    # Energy Variables
+    # 定义变量
+    # q_da: 日前承诺电量 (MW)
+    # q_rt: 实时实际调度电量 (MW)
     q_da = m.addVars(T, lb=-power_max_mw, ub=power_max_mw, name="q_da")
     q_rt = m.addVars(T, lb=-power_max_mw, ub=power_max_mw, name="q_rt")
     
-    # SoC Variables (0 to 1 normalized, or MWh)
-    # Let's use MWh
-    soc = m.addVars(T+1, lb=0, ub=soc_max_mwh, name="soc")
+    # soc: 电池荷电状态 (MWh) (实时)
+    soc_rt = m.addVars(T+1, lb=0, ub=soc_max_mwh, name="soc_rt")
+    # soc: 电池荷电状态 (MWh) (日前 - 用于确保计划可行性)
+    soc_da = m.addVars(T+1, lb=0, ub=soc_max_mwh, name="soc_da")
     
-    # Auxiliary variables for degradation cost (Absolute value of power)
-    # Degradation = Cost * |Power| * dt? 
-    # MetaDataset degradation: - self.DEGRATIO*self.MAXP*(energy_action_rt*(energy_action_rt>0) + 0.25*regup_action_rt)
-    # It seems to penalize discharge and RegUp?
-    # Standard battery degradation model usually proportional to throughput (cycle aging).
-    # Let's strictly follow MetaDataset logic if possible to be comparable.
-    # MetaDataset: reward_degradation = - DEGRATIO * MAXP * (E_rt * (E_rt>0) + 0.25 * RegUp_rt)
-    # It only penalizes DISCHARGING energy? That's common if simplified.
-    
-    # Let's model split for discharge/charge to handle efficiency and cost
+    # 辅助变量：用于计算充电和放电的物理量
+    # 实时
     q_rt_dis = m.addVars(T, lb=0, ub=power_max_mw, name="q_rt_dis")
     q_rt_chg = m.addVars(T, lb=0, ub=power_max_mw, name="q_rt_chg")
+    # 日前 (分解变量以计算日前SoC)
+    q_da_dis = m.addVars(T, lb=0, ub=power_max_mw, name="q_da_dis")
+    q_da_chg = m.addVars(T, lb=0, ub=power_max_mw, name="q_da_chg")
     
+    # 约束：实时功率平衡 Q_rt = Dis - Chg
     m.addConstrs((q_rt[t] == q_rt_dis[t] - q_rt_chg[t] for t in range(T)), "link_q_rt")
+    # 约束：日前功率平衡 Q_da = Dis - Chg
+    m.addConstrs((q_da[t] == q_da_dis[t] - q_da_chg[t] for t in range(T)), "link_q_da")
     
-    # Initial SoC
-    m.addConstr(soc[0] == initial_soc * soc_max_mwh, "init_soc")
+    # 约束：初始 SoC
+    m.addConstr(soc_rt[0] == initial_soc * soc_max_mwh, "init_soc_rt")
+    m.addConstr(soc_da[0] == initial_soc * soc_max_mwh, "init_soc_da")
     
-    # SoC Dynamics
-    # SoC(t+1) = SoC(t) - Discharge * dt / eff + Charge * dt * eff (Wait, Discharge drains SoC)
-    # Discharging (Output > 0): Drains Energy/Efficiency (losses occur inside?) or Energy * 1?
-    # MetaDataset: 
-    # discharge_soc_action = energy_action_rt*(energy_action_rt>0) + ...
-    # charge_soc_action = energy_action_rt*(energy_action_rt<=0) ...
-    # new_soc = soc - MAXPRTRATIO * (discharge_soc_action + charge_soc_action)
-    # MAXPRTRATIO = MAXP / MAXSOC / 12 (12 steps per hour = dt) -> P_MW / E_MWh * (5/60)
-    # Logic in code:
-    # discharge_soc_action = energy (>0) 
-    # charge_soc_action = energy (<0)
-    # But wait, logic line 427: discharge_soc_action = ... + 0.25*regup/EFFICIENCY
-    # charge_soc_action = ... - 0.25*regdown/EFFICIENCY
-    # Actually wait.
-    # Line 427: discharge_soc_action = energy_action_rt*(energy_action_rt>0) + ...
-    # Line 428: charge_soc_action = energy_action_rt*(energy_action_rt<=0) - ... (minus negative = plus positive magnitude)
-    # Wait, efficiency division?
-    # Re-reading MetaDataset calc:
-    # discharge_soc_action = energy > 0 ... / EFFICIENCY (line 427 in edited versions? Or original?)
-    # Original snippet provided earlier: 
-    # discharge_soc_action = energy_action_rt*(energy_action_rt>0) + 0.25*regup_action_rt/self.EFFICIENCY
-    # charge_soc_action = energy_action_rt*(energy_action_rt<=0) - 0.25*regdown_action_rt/self.EFFICIENCY
+    # 约束：SoC 动态方程 (实时)
+    # SoC(t+1) = SoC(t) - 放电/效率*dt + 充电*效率*dt
+    m.addConstrs((soc_rt[t+1] == soc_rt[t] - (q_rt_dis[t] / eff_single) * dt + (q_rt_chg[t] * eff_single) * dt for t in range(T)), "soc_update_rt")
     
-    # It seems in MetaDataset.py provided:
-    # discharge_soc_action = energy_action_rt*(energy_action_rt>0) + 0.25*regup_action_rt/self.EFFICIENCY
-    # It divides by efficiency for AS?
-    # What about Energy? Checks again.
-    # Line 433 (approx): new_soc = self._soc[-1] - self.MAXPRTRATIO * total_soc_discharge_action
+    # 约束：SoC 动态方程 (日前 - 虚拟轨迹，确保承诺可行)
+    m.addConstrs((soc_da[t+1] == soc_da[t] - (q_da_dis[t] / eff_single) * dt + (q_da_chg[t] * eff_single) * dt for t in range(T)), "soc_update_da")
     
-    # Let's use simpler standard battery model:
-    # E(t+1) = E(t) - (q_dis / eff) * dt + (q_chg * eff) * dt
-    # If MetaDataset logic is different, result might differ slightly.
-    # Assuming standard:
+    # 构建目标函数
+    total_profit = 0
     
-    m.addConstrs((soc[t+1] == soc[t] - (q_rt_dis[t] / eff_single) * dt + (q_rt_chg[t] * eff_single) * dt for t in range(T)), "soc_update")
-    
-    # Objective Function
-    obj = 0
-    
-    # 1. Energy Market Revenue
-    # R_E = Q_da * P_da + (Q_rt - Q_da) * P_rt = Q_da * (P_da - P_rt) + Q_rt * P_rt
-    # We maximize this sum over T
     for t in range(T):
-        p_rt = rt_prices['energy'][t]
-        p_da = da_prices['energy'][t]
+        p_rt = rt_prices[t]
+        p_da = da_prices[t]
         
-        rev_energy = q_da[t] * (p_da - p_rt) + q_rt[t] * p_rt
+        # 收益公式:
+        # 日前结算 = Q_da * P_da
+        # 实时结算 = (Q_rt - Q_da) * P_rt
+        # 实际上 = Q_da * (P_da - P_rt) + Q_rt * P_rt
+        revenue_step = q_da[t] * p_da + (q_rt[t] - q_da[t]) * p_rt
         
-        # Degradation Cost
-        # MetaDataset: - DEGRATIO * MAXP * (Energy(>0)) -> Only discharge
-        deg_cost = degradation_cost * q_rt_dis[t] * dt # Is it per MWh? Yes, DEGRATIO is $/MWh.
-        # But wait, MetaDataset degradation calc: - self.DEGRATIO * self.MAXP * (energy_action_rt (>0))
-        # energy_action is normalized (-1 to 1). MAXP is MW.
-        # So DEGRATIO * Energy_MW. This is cost per STEP? or rate?
-        # Usually DEGRATIO is $/MWh-throughput.
-        # If formula is DEGRATIO * Power, and added to reward per step.
-        # If reward is summed, then total cost = Sum(Deg * Power).
-        # Depending on if DEGRATIO is scaled by time or not.
-        # MetaDataset DEGRATIO is sampled ~50.
-        # Typically $/MWh. So Cost = 50 * Power_MW * dt_h.
-        # Code: reward_degradation = - self.DEGRATIO * self.MAXP * (...)
-        # It creates a reward term directly.
-        # If the reward accumulates to total profit, we must assume DEGRATIO in code is implicitly handled or scaled.
-        # However, usually cost is Power * dt (Energy) * Price.
-        # If code doesn't multiply by dt (1/12), then DEGRATIO in code might be huge or interpreted as $/MW-step?
-        # Let's look closer at training code.
-        # total_epoches trained.
-        # In MetaDataset, it simply sums `reward_market_revenue` and `reward_degradation`.
-        # `reward_market_revenue` is Power * Price * MAXP * (dt? No).
-        # Wait. `reward_market_revenue_per_market = ... * self.MAXP`.
-        # `rev_energy_base = settlement(...)`. Settlement is Q * P.
-        # If P is $/MWh. Q is normalized [0,1].
-        # Revenue = Q * P * MAXP = [1] * [$/MWh] * [MW]. Unit is $/h.
-        # If we sum $/h over steps without * dt, we get something proportional to energy but scaled by 12.
-        # Unless Environment step size is implicitly considered 1 unit.
-        # For Optimization, to get REAL dollars, we should use * dt.
-        # But for comparison with RL agent reward (which might be unscaled), we might need to match format.
-        # Generally, Profit ($) = sum( Power(MW) * Price($/MWh) * dt(h) ).
-        # If RL env returns Reward = Power * Price, then RL Reward is rate ($/h).
-        # Total Eps Reward = Sum(Rate). Real Profit = Sum(Rate) * dt.
-        # We will calculate REAL PROFIT here.
+        # 电池老化成本 (仅针对实际发生的实时放电部分)
+        cost_deg_step = degradation_cost * q_rt_dis[t]
         
-        # Revenue
-        obj += rev_energy * dt
+        # 累加
+        total_profit += (revenue_step - cost_deg_step) * dt
         
-        # Cost
-        obj -= deg_cost # deg_cost already includes dt
-        
-    m.setObjective(obj, GRB.MAXIMIZE)
+    m.setObjective(total_profit, GRB.MAXIMIZE)
     
+    # 开始求解
+    print("正在求解优化问题 (已添加日前物理约束)...")
     m.optimize()
     
     if m.status == GRB.OPTIMAL:
-        print("\nOptimal Solution Found")
-        total_obj = m.objVal
-        print(f"Total Objective (Profit): ${total_obj:.2f}")
+        print("\n=== 最优解已找到 ===")
         
-        # Extract Results
+        # 提取结果
         q_da_val = np.array([q_da[t].x for t in range(T)])
         q_rt_val = np.array([q_rt[t].x for t in range(T)])
-        soc_val = np.array([soc[t].x for t in range(T+1)])
+        q_rt_dis_val = np.array([q_rt_dis[t].x for t in range(T)])
+        soc_val = np.array([soc_rt[t].x for t in range(T+1)])
+        soc_da_val = np.array([soc_da[t].x for t in range(T+1)])
         
-        # Plotting
-        plt.figure(figsize=(15, 10))
+        # 计算详细收益指标
+        income_da = np.sum(q_da_val * da_prices) * dt
+        income_rt = np.sum((q_rt_val - q_da_val) * rt_prices) * dt
+        cost_degradation = np.sum(q_rt_dis_val * degradation_cost) * dt
+        net_profit = income_da + income_rt - cost_degradation
         
-        # 1. Prices
-        plt.subplot(3, 1, 1)
-        plt.plot(rt_prices['energy'], label='RT Price', color='orange')
-        plt.plot(da_prices['energy'], label='DA Price', color='cyan', linestyle='--')
-        plt.legend()
-        plt.title("Energy Prices ($/MWh)")
-        plt.grid(True, alpha=0.3)
+        # 打印控制台报告
+        print(f"{'指标':<20} | {'数值':>10}")
+        print("-" * 35)
+        print(f"{'总净利润 (Net Profit)':<20} | ${net_profit:10.2f}")
+        print(f"{'日前市场收益 (DA)':<20} | ${income_da:10.2f}")
+        print(f"{'实时市场收益 (RT)':<20} | ${income_rt:10.2f}")
+        print(f"{'电池老化成本 (Cost)':<20} | ${cost_degradation:10.2f}")
+        print("-" * 35)
         
-        # 2. Actions
-        plt.subplot(3, 1, 2)
-        plt.plot(q_rt_val, label='RT Dispatch (MW)', color='blue')
-        plt.plot(q_da_val, label='DA Commitment (MW)', color='red', linestyle='--')
-        plt.legend()
-        plt.title("Optimal Dispatch")
-        plt.ylabel("MW")
-        plt.grid(True, alpha=0.3)
+        # 绘图 (使用英文标签以兼容无中文字库环境)
+        plt.figure(figsize=(12, 12))
         
-        # 3. SoC
-        plt.subplot(3, 1, 3)
-        plt.plot(soc_val, label='SoC (MWh)', color='green')
-        plt.axhline(y=soc_max_mwh, color='k', linestyle=':', alpha=0.5)
-        plt.axhline(y=0, color='k', linestyle=':', alpha=0.5)
-        plt.legend()
-        plt.title("State of Charge")
-        plt.xlabel("Time Step (5-min)")
-        plt.ylabel("MWh")
-        plt.grid(True, alpha=0.3)
+        # 图1: 电价对比
+        ax1 = plt.subplot(3, 1, 1)
+        ax1.plot(rt_prices, label='RT Price', color='#ff7f0e', alpha=0.8)
+        ax1.plot(da_prices, label='DA Price', color='#1f77b4', linestyle='--', alpha=0.8)
+        ax1.set_ylabel("Price ($/MWh)")
+        ax1.set_title(f"Price Profile (Node: {node})")
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # 图2: 投标与调度
+        ax2 = plt.subplot(3, 1, 2, sharex=ax1)
+        ax2.plot(q_rt_val, label='RT Dispatch', color='#2ca02c', linewidth=2)
+        ax2.plot(q_da_val, label='DA Plan', color='#d62728', linestyle='--', linewidth=2)
+        ax2.set_ylabel("Power (MW)")
+        ax2.set_title("Day-Ahead Plan vs Real-Time Dispatch")
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        # 图3: 荷电状态 SoC
+        ax3 = plt.subplot(3, 1, 3, sharex=ax1)
+        ax3.plot(soc_val, label='RT SoC', color='#9467bd', linewidth=2)
+        ax3.plot(soc_da_val, label='DA Planned SoC', color='#d62728', linestyle='--', linewidth=1.5, alpha=0.7)
+        ax3.axhline(soc_max_mwh, color='k', linestyle=':', alpha=0.5, label='Max SoC')
+        ax3.axhline(0, color='k', linestyle=':', alpha=0.5, label='Min SoC')
+        ax3.set_ylabel("Energy (MWh)")
+        ax3.set_xlabel("Time Step (5-min intervals)")
+        ax3.set_title("State of Charge (SoC)")
+        ax3.legend()
+        ax3.grid(True, alpha=0.3)
         
         plt.tight_layout()
-        plt.savefig("optimal_bidding_result.png")
-        print("Plot saved to optimal_bidding_result.png")
+        save_path = "optimal_bidding_plot.png"
+        plt.savefig(save_path, dpi=100)
+        print(f"\n图表已保存至: {save_path}")
         
-        return
     else:
-        print("Optimization failed")
+        print("优化求解失败。")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data_path", default="meta_bidding/data/pjm_data/pjm_price_train_dual.pkl")
-    parser.add_argument("--node", default="AECO")
-    parser.add_argument("--days", type=int, default=1)
+    parser = argparse.ArgumentParser(description="PJM 电池储能最优投标计算器 (标准答案)")
+    parser.add_argument("--data_path", type=str, default="meta_bidding/data/pjm_data/pjm_price_train_dual.pkl", help="价格数据路径")
+    parser.add_argument("--node", type=str, default="AECO", help="PJM 节点名称")
+    parser.add_argument("--days", type=int, default=1, help="计算天数")
+    parser.add_argument("--degradation_cost", type=float, default=50.0, help="电池老化成本 ($/MWh)")
+    
     args = parser.parse_args()
     
     solve_optimal_bidding(
         price_data_path=args.data_path,
         node=args.node,
-        horizon_hours=24*args.days
+        horizon_hours=24 * args.days,
+        degradation_cost=args.degradation_cost
     )
