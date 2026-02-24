@@ -29,7 +29,7 @@ parser.add_argument("--iso",default=argparse.SUPPRESS,type=str,help="PJM, CAISO,
 # multi select choice: energy regulation reserve
 parser.add_argument('--product',choices=['energy', 'regulation', 'reserve'],default=['energy', 'regulation', 'reserve'],nargs='+',help='Choose the market')
 parser.add_argument("--soc",default=4,type=float,help="The fixed soc hour of the energy storage")
-parser.add_argument("--degradation_cost",default=50.0,type=float,help="Battery degradation cost ($/MWH-cycle)")
+parser.add_argument("--degradation_cost",default=10.0,type=float,help="Battery degradation cost ($/MWH-cycle)")
 parser.add_argument('--node',choices=['AECO'],default=['AECO'],nargs='+',help='Choose the node')
 
 parser.add_argument("--checkpoint",default=None,type=str,help="checkpoint path")

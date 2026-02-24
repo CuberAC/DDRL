@@ -4,219 +4,269 @@ import gurobipy as gp
 from gurobipy import GRB
 import argparse
 import matplotlib.pyplot as plt
+import os
+import sys
 
-# 设置 Matplotlib 后端，避免在无显示器环境下报错
+# Set Matplotlib backend
 plt.switch_backend('Agg')
 
-def solve_optimal_bidding(
-    price_data_path, 
+def solve_optimal_bidding_day(
+    df_day, 
+    date_str,
+    save_dir,
     node='AECO', 
-    soc_max_mwh=1.0, 
+    soc_max_mwh=4.0, 
     power_max_mw=1.0, 
     efficiency=0.9, 
-    degradation_cost=0, 
-    initial_soc=0.5,
-    horizon_hours=24
+    initial_soc=0.5
 ):
     """
-    使用 Gurobi 求解基于完美价格预测的最优日前和实时投标策略。
-    包括收益分解计算和绘图功能。
+    Solve optimal bidding for a single day (24 hours, 288 steps).
+    Includes strictly feasible Day-Ahead schedule constraints.
     """
-    print(f"正在加载数据: {price_data_path}...")
-    try:
-        df = pd.read_pickle(price_data_path)
-    except Exception as e:
-        print(f"数据加载失败: {e}")
-        return
+    T = len(df_day)
+    # Usually T should be 288 steps (5 min)
+    if T < 280:
+        print(f"[{date_str}] Warning: Data length is {T}, expected ~288. Skipping.")
+        return None
+        
+    T_optim = 288 # Standardize to 288 steps
+    if T > T_optim: T_optim = 288 # Clip if larger
+    if T < T_optim: T_optim = T # Clip if smaller (though we warned)
+    
+    # Constants
+    dt_rt = 1.0 / 12.0 # RT step: 5 minutes in hours
+    dt_da = 1.0        # DA step: 1 hour in hours
+    eff_sqrt = np.sqrt(efficiency) # One-way efficiency
+    
+    # Prices (Align to T_optim)
+    rt_prices = df_day['RRP'].values[:T_optim]
+    
+    if 'DA_RRP' in df_day.columns:
+        da_prices_5min = df_day['DA_RRP'].values[:T_optim]
+    else:
+        # Fallback
+        da_cols = [c for c in df_day.columns if c.startswith('DA_')]
+        if da_cols:
+            da_prices_5min = df_day[da_cols[0]].values[:T_optim]
+        else:
+            da_prices_5min = rt_prices
 
-    # 按节点筛选数据
-    if 'REGIONID' in df.columns and node:
-        df = df[df['REGIONID'] == node]
-        print(f"已筛选节点 {node} 的数据，共 {len(df)} 行。")
+    # --- Gurobi Model ---
+    m = gp.Model(f"OptimalBidding_{date_str}")
+    m.setParam('OutputFlag', 0)
     
-    if len(df) == 0:
-        print("未找到数据。")
-        return
-
-    # 时间参数
-    dt = 5.0 / 60.0 # 5分钟对应的小时数
-    dt_steps_per_hour = 12
-    T = int(horizon_hours * dt_steps_per_hour) # 总时间步数
+    # --- Variables ---
     
-    # 截取前 T 个时间步的数据 (原始 5min)
-    # 为了适应 Gurobi 限制版 License (2000 变量限制), 我们将数据重采样到 15 分钟间隔
-    # T_raw = horizon 24h * 12 = 288
-    # T_new = horizon 24h * 4 = 96
+    # 1. Day-Ahead (Hourly)
+    # To correctly track SoC, we need split Charge/Discharge variables for DA
+    q_da_chg = m.addVars(24, lb=0, ub=power_max_mw, name="q_da_chg")
+    q_da_dis = m.addVars(24, lb=0, ub=power_max_mw, name="q_da_dis")
+    soc_da   = m.addVars(25, lb=0, ub=soc_max_mwh, name="soc_da") # 0 to 24 indices
     
-    # 原始切片
-    df_raw = df.iloc[:int(horizon_hours * 12)].copy().reset_index(drop=True)
+    # 2. Real-Time (5-min)
+    q_rt_chg = m.addVars(T_optim, lb=0, ub=power_max_mw, name="q_rt_chg")
+    q_rt_dis = m.addVars(T_optim, lb=0, ub=power_max_mw, name="q_rt_dis")
+    soc_rt   = m.addVars(T_optim+1, lb=0, ub=soc_max_mwh, name="soc_rt")
     
-    # 重采样处理
-    # 假设数据索引是连续的 5min, 我们可以每 3 行取平均
-    resample_factor = 3 # 5min -> 15min
+    # --- Constraints ---
     
-    # 提取并重采样价格
-    # 注意: RRP 和 DA_RRP 是时段价格, 取平均是合理的
-    rt_prices_raw = df_raw['RRP'].values
-    da_prices_raw = df_raw['DA_RRP'].values
+    # A. Initial State
+    init_energy = initial_soc * soc_max_mwh
+    m.addConstr(soc_da[0] == init_energy, "InitSoC_DA")
+    m.addConstr(soc_rt[0] == init_energy, "InitSoC_RT")
     
-    # Reshape and mean
-    # 确保长度能被 3 整除
-    trim_len = (len(rt_prices_raw) // resample_factor) * resample_factor
-    rt_prices = rt_prices_raw[:trim_len].reshape(-1, resample_factor).mean(axis=1)
-    da_prices = da_prices_raw[:trim_len].reshape(-1, resample_factor).mean(axis=1)
+    # B. Day-Ahead Constraints (Hourly)
+    for h in range(24):
+        # SoC Evolution: S_{h+1} = S_h + (Chg*Eff - Dis/Eff) * dt_da
+        # UNIT CHECK: MW * h * 1 = MWh. Correct.
+        m.addConstr(
+            soc_da[h+1] == soc_da[h] + (q_da_chg[h] * eff_sqrt - q_da_dis[h] / eff_sqrt) * dt_da,
+            f"SoC_Rule_DA_{h}"
+        )
     
-    # 更新时间参数
-    dt = (5.0 * resample_factor) / 60.0 # 15分钟 = 0.25 小时
-    T = len(rt_prices)
-    
-    print(f"数据已重采样为 {dt*60:.0f} 分钟间隔, 时间步数: {T}")
-    
-    # 效率参数转换为单程效率: sqrt(0.9) approx 0.948
-    eff_single = np.sqrt(efficiency) 
-    
-    # 创建 Gurobi 模型
-    m = gp.Model("OptimalBidding")
-    m.setParam('OutputFlag', 0) # 关闭冗余输出，仅显示最终结果
-
-    # 定义变量
-    # q_da: 日前承诺电量 (MW)
-    # q_rt: 实时实际调度电量 (MW)
-    q_da = m.addVars(T, lb=-power_max_mw, ub=power_max_mw, name="q_da")
-    q_rt = m.addVars(T, lb=-power_max_mw, ub=power_max_mw, name="q_rt")
-    
-    # soc: 电池荷电状态 (MWh) (实时)
-    soc_rt = m.addVars(T+1, lb=0, ub=soc_max_mwh, name="soc_rt")
-    # soc: 电池荷电状态 (MWh) (日前 - 用于确保计划可行性)
-    soc_da = m.addVars(T+1, lb=0, ub=soc_max_mwh, name="soc_da")
-    
-    # 辅助变量：用于计算充电和放电的物理量
-    # 实时
-    q_rt_dis = m.addVars(T, lb=0, ub=power_max_mw, name="q_rt_dis")
-    q_rt_chg = m.addVars(T, lb=0, ub=power_max_mw, name="q_rt_chg")
-    # 日前 (分解变量以计算日前SoC)
-    q_da_dis = m.addVars(T, lb=0, ub=power_max_mw, name="q_da_dis")
-    q_da_chg = m.addVars(T, lb=0, ub=power_max_mw, name="q_da_chg")
-    
-    # 约束：实时功率平衡 Q_rt = Dis - Chg
-    m.addConstrs((q_rt[t] == q_rt_dis[t] - q_rt_chg[t] for t in range(T)), "link_q_rt")
-    # 约束：日前功率平衡 Q_da = Dis - Chg
-    m.addConstrs((q_da[t] == q_da_dis[t] - q_da_chg[t] for t in range(T)), "link_q_da")
-    
-    # 约束：初始 SoC
-    m.addConstr(soc_rt[0] == initial_soc * soc_max_mwh, "init_soc_rt")
-    m.addConstr(soc_da[0] == initial_soc * soc_max_mwh, "init_soc_da")
-    
-    # 约束：SoC 动态方程 (实时)
-    # SoC(t+1) = SoC(t) - 放电/效率*dt + 充电*效率*dt
-    m.addConstrs((soc_rt[t+1] == soc_rt[t] - (q_rt_dis[t] / eff_single) * dt + (q_rt_chg[t] * eff_single) * dt for t in range(T)), "soc_update_rt")
-    
-    # 约束：SoC 动态方程 (日前 - 虚拟轨迹，确保承诺可行)
-    m.addConstrs((soc_da[t+1] == soc_da[t] - (q_da_dis[t] / eff_single) * dt + (q_da_chg[t] * eff_single) * dt for t in range(T)), "soc_update_da")
-    
-    # 构建目标函数
-    total_profit = 0
-    
-    for t in range(T):
-        p_rt = rt_prices[t]
-        p_da = da_prices[t]
+    # C. Real-Time Constraints (5-min)
+    # RT must track actual SoC evolution with 5-min steps
+    for t in range(T_optim):
+        # SoC Evolution
+        m.addConstr(
+            soc_rt[t+1] == soc_rt[t] + (q_rt_chg[t] * eff_sqrt - q_rt_dis[t] / eff_sqrt) * dt_rt,
+            f"SoC_Rule_RT_{t}"
+        )
         
-        # 收益公式:
-        # 日前结算 = Q_da * P_da
-        # 实时结算 = (Q_rt - Q_da) * P_rt
-        # 实际上 = Q_da * (P_da - P_rt) + Q_rt * P_rt
-        revenue_step = q_da[t] * p_da + (q_rt[t] - q_da[t]) * p_rt
-        
-        # 电池老化成本 (仅针对实际发生的实时放电部分)
-        cost_deg_step = degradation_cost * q_rt_dis[t]
-        
-        # 累加
-        total_profit += (revenue_step - cost_deg_step) * dt
-        
-    m.setObjective(total_profit, GRB.MAXIMIZE)
+    # --- Objective Function ---
+    obj_expr = 0
     
-    # 开始求解
-    print("正在求解优化问题 (已添加日前物理约束)...")
+    for t in range(T_optim):
+        h = int(t / 12)
+        if h >= 24: h = 23
+        
+        # DA Quantity for present hourly block
+        q_da_net_h = q_da_dis[h] - q_da_chg[h]
+        
+        # RT Quantity for present 5-min interval
+        q_rt_net_t = q_rt_dis[t] - q_rt_chg[t]
+        
+        # 1. DA Revenue
+        # DA settles hourly. We accrue 1/12th per step to match loop structure.
+        # This is mathematically equivalent to sum(Q_DA_h * P_DA_h * 1h) because sum(dt_rt over hour) = 1h.
+        rev_da_step = q_da_net_h * da_prices_5min[t] * dt_rt
+        
+        # 2. RT Deviation Revenue
+        # Deviation = RT_Net - DA_Net
+        rev_rt_step = (q_rt_net_t - q_da_net_h) * rt_prices[t] * dt_rt
+        
+        obj_expr += rev_da_step + rev_rt_step
+        
+    m.setObjective(obj_expr, GRB.MAXIMIZE)
+    
+    # Optimize
     m.optimize()
     
-    if m.status == GRB.OPTIMAL:
-        print("\n=== 最优解已找到 ===")
+    if m.Status != GRB.OPTIMAL:
+        print(f"[{date_str}] Solver Failed. Status: {m.Status}")
+        return None
         
-        # 提取结果
-        q_da_val = np.array([q_da[t].x for t in range(T)])
-        q_rt_val = np.array([q_rt[t].x for t in range(T)])
-        q_rt_dis_val = np.array([q_rt_dis[t].x for t in range(T)])
-        soc_val = np.array([soc_rt[t].x for t in range(T+1)])
-        soc_da_val = np.array([soc_da[t].x for t in range(T+1)])
-        
-        # 计算详细收益指标
-        income_da = np.sum(q_da_val * da_prices) * dt
-        income_rt = np.sum((q_rt_val - q_da_val) * rt_prices) * dt
-        cost_degradation = np.sum(q_rt_dis_val * degradation_cost) * dt
-        net_profit = income_da + income_rt - cost_degradation
-        
-        # 打印控制台报告
-        print(f"{'指标':<20} | {'数值':>10}")
-        print("-" * 35)
-        print(f"{'总净利润 (Net Profit)':<20} | ${net_profit:10.2f}")
-        print(f"{'日前市场收益 (DA)':<20} | ${income_da:10.2f}")
-        print(f"{'实时市场收益 (RT)':<20} | ${income_rt:10.2f}")
-        print(f"{'电池老化成本 (Cost)':<20} | ${cost_degradation:10.2f}")
-        print("-" * 35)
-        
-        # 绘图 (使用英文标签以兼容无中文字库环境)
-        plt.figure(figsize=(12, 12))
-        
-        # 图1: 电价对比
-        ax1 = plt.subplot(3, 1, 1)
-        ax1.plot(rt_prices, label='RT Price', color='#ff7f0e', alpha=0.8)
-        ax1.plot(da_prices, label='DA Price', color='#1f77b4', linestyle='--', alpha=0.8)
-        ax1.set_ylabel("Price ($/MWh)")
-        ax1.set_title(f"Price Profile (Node: {node})")
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
-        
-        # 图2: 投标与调度
-        ax2 = plt.subplot(3, 1, 2, sharex=ax1)
-        ax2.plot(q_rt_val, label='RT Dispatch', color='#2ca02c', linewidth=2)
-        ax2.plot(q_da_val, label='DA Plan', color='#d62728', linestyle='--', linewidth=2)
-        ax2.set_ylabel("Power (MW)")
-        ax2.set_title("Day-Ahead Plan vs Real-Time Dispatch")
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
-        
-        # 图3: 荷电状态 SoC
-        ax3 = plt.subplot(3, 1, 3, sharex=ax1)
-        ax3.plot(soc_val, label='RT SoC', color='#9467bd', linewidth=2)
-        ax3.plot(soc_da_val, label='DA Planned SoC', color='#d62728', linestyle='--', linewidth=1.5, alpha=0.7)
-        ax3.axhline(soc_max_mwh, color='k', linestyle=':', alpha=0.5, label='Max SoC')
-        ax3.axhline(0, color='k', linestyle=':', alpha=0.5, label='Min SoC')
-        ax3.set_ylabel("Energy (MWh)")
-        ax3.set_xlabel("Time Step (5-min intervals)")
-        ax3.set_title("State of Charge (SoC)")
-        ax3.legend()
-        ax3.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        save_path = "optimal_bidding_plot.png"
-        plt.savefig(save_path, dpi=100)
-        print(f"\n图表已保存至: {save_path}")
-        
-    else:
-        print("优化求解失败。")
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="PJM 电池储能最优投标计算器 (标准答案)")
-    parser.add_argument("--data_path", type=str, default="meta_bidding/data/pjm_data/pjm_price_train_dual.pkl", help="价格数据路径")
-    parser.add_argument("--node", type=str, default="AECO", help="PJM 节点名称")
-    parser.add_argument("--days", type=int, default=1, help="计算天数")
-    parser.add_argument("--degradation_cost", type=float, default=50.0, help="电池老化成本 ($/MWh)")
+    # --- Results extraction ---
+    total_rev = m.ObjVal
     
+    def get_vals(vars_dict, n):
+        return np.array([vars_dict[i].x for i in range(n)])
+    
+    q_da_chg_h = get_vals(q_da_chg, 24)
+    q_da_dis_h = get_vals(q_da_dis, 24)
+    q_da_net_h = q_da_dis_h - q_da_chg_h
+    soc_da_res_hourly = get_vals(soc_da, 25)
+    
+    # Interpolate DA SoC (Linear) for plotting
+    soc_da_res_5min = []
+    for h in range(24):
+        start_s = soc_da_res_hourly[h]
+        end_s = soc_da_res_hourly[h+1]
+        lin = np.linspace(start_s, end_s, 13)[:-1]
+        soc_da_res_5min.append(lin)
+    soc_da_res_5min = np.concatenate(soc_da_res_5min)
+
+    # Expand DA Power (Step)
+    q_da_net_5min = np.repeat(q_da_net_h, 12)
+
+    q_rt_chg_vals = get_vals(q_rt_chg, T_optim)
+    q_rt_dis_vals = get_vals(q_rt_dis, T_optim)
+    q_rt_net_vals = q_rt_dis_vals - q_rt_chg_vals
+    soc_rt_res = get_vals(soc_rt, T_optim+1)
+    
+    da_rev_sum = 0
+    rt_rev_sum = 0
+    
+    # Careful Summation for exact numbers
+    for t in range(T_optim):
+        # da_rev_sum += q_da_net_5min[t] * da_prices_5min[t] * dt_rt
+        # rt_rev_sum += (q_rt_net_vals[t] - q_da_net_5min[t]) * rt_prices[t] * dt_rt
+        
+        # New Formula: DA = Arbitrage (Q_da * (P_da - P_rt)), RT = Physical (Q_rt * P_rt)
+        da_rev_sum += q_da_net_5min[t] * (da_prices_5min[t] - rt_prices[t]) * dt_rt
+        rt_rev_sum += q_rt_net_vals[t] * rt_prices[t] * dt_rt
+
+    # Ensure length match for plotting (sometimes T_optim < 288)
+    plot_len = min(len(soc_da_res_5min), len(soc_rt_res))
+    time_axis = np.arange(plot_len) * dt_rt
+
+    # --- Plotting ---
+    fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
+    
+    # 1. Prices
+    axes[0].step(time_axis, da_prices_5min[:plot_len], where='post', label='DA Price', color='blue', linestyle='--')
+    axes[0].plot(time_axis, rt_prices[:plot_len], label='RT Price', color='orange', alpha=0.7)
+    axes[0].set_ylabel("Price ($/MWh)")
+    axes[0].set_title(f"Optimization Results: {date_str} (Profit: ${total_rev:.0f})")
+    axes[0].legend(loc='upper right')
+    
+    # 2. Power
+    axes[1].step(time_axis, q_da_net_5min[:plot_len], where='post', label='DA Bid (MW)', color='green', linewidth=2)
+    axes[1].plot(time_axis, q_rt_net_vals[:plot_len], label='RT Dispatch (MW)', color='red', alpha=0.5)
+    axes[1].set_ylabel("Power (MW)")
+    axes[1].legend(loc='upper right')
+    
+    # 3. SoC (Comparison)
+    axes[2].plot(time_axis, soc_da_res_5min[:plot_len], label='DA Virtual SoC', color='green', linestyle='--', linewidth=2)
+    axes[2].plot(time_axis, soc_rt_res[:plot_len], label='RT Actual SoC', color='purple', alpha=0.8)
+    axes[2].plot(time_axis, [soc_max_mwh]*plot_len, 'k--', alpha=0.3, label='Max SoC')
+    axes[2].plot(time_axis, [0]*plot_len, 'k--', alpha=0.3)
+    axes[2].set_ylabel("Energy (MWh)")
+    axes[2].set_xlabel("Hours")
+    axes[2].legend(loc='upper right')
+    
+    plot_path = os.path.join(save_dir, f"{date_str}_optimal.png")
+    plt.tight_layout()
+    plt.savefig(plot_path)
+    plt.close()
+
+    return {
+        'Date': date_str,
+        'Day-Ahead Revenue ($)': da_rev_sum,
+        'Real-Time Revenue ($)': rt_rev_sum, 
+        'Total Revenue ($)': total_rev,
+        'net_profit': total_rev
+    }
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--node", type=str, default='AECO', help="Node ID")
+    parser.add_argument("--save_dir", type=str, default='eval_results_custom/optimal_bidding')
     args = parser.parse_args()
     
-    solve_optimal_bidding(
-        price_data_path=args.data_path,
-        node=args.node,
-        horizon_hours=24 * args.days,
-        degradation_cost=args.degradation_cost
-    )
+    os.makedirs(args.save_dir, exist_ok=True)
+    
+    data_path = "/root/DDRL/meta_bidding/data/pjm_data/pjm_price_test_dual_split.pkl"
+    if not os.path.exists(data_path):
+        print("Data not found.")
+        return
+
+    df = pd.read_pickle(data_path)
+    if 'REGIONID' in df.columns:
+        df = df[df['REGIONID'] == args.node]
+    
+    if 'SETTLEMENTDATE' in df.columns:
+        df['dt'] = pd.to_datetime(df['SETTLEMENTDATE'])
+    else:
+        df['dt'] = pd.to_datetime(df.index)
+    
+    df['date_str'] = df['dt'].dt.strftime('%Y-%m-%d')
+    df['day_of_month'] = df['dt'].dt.day
+    
+    test_dates = sorted(df[df['day_of_month'] >= 28]['date_str'].unique())
+    print(f"Found {len(test_dates)} dates.")
+    
+    results = []
+    for date_str in test_dates:
+        print(f"Optimizing {date_str}...")
+        df_day = df[df['date_str'] == date_str].copy()
+        res = solve_optimal_bidding_day(
+            df_day, date_str, args.save_dir, 
+            node=args.node,
+            soc_max_mwh=4.0, 
+            power_max_mw=1.0
+        )
+        if res: results.append(res)
+            
+    if results:
+        df_res = pd.DataFrame(results)
+        # Average
+        avg_row = df_res.mean(numeric_only=True)
+        avg_row['Date'] = 'Average'
+        df_res = pd.concat([df_res, pd.DataFrame([avg_row])], ignore_index=True)
+        
+        path1 = os.path.join(args.save_dir, "daily_performance_summary.csv")
+        path2 = "/root/DDRL/optimal_bidding_year_results.csv"
+        df_res.to_csv(path1, index=False)
+        df_res.to_csv(path2, index=False)
+        
+        print("\nOptimization Complete.")
+        print(f"Saved: {path1}")
+        print(f"Saved: {path2}")
+        print("Average Profit: {:.2f}".format(avg_row['Total Revenue ($)']))
+    else:
+        print("No results.")
+
+if __name__ == "__main__":
+    main()

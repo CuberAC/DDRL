@@ -295,9 +295,11 @@ class LSTMTrainer(DDRLTrainer):
         # Remvoed no_grad to allow gradient flow for DDRL
         virtual_soc = self.env._soc[-1].detach().clone()  # (B,)
         maxptr_hourly = self.env.MAXPRTRATIO * 12.0  # (B,) Convert 5min ratio to HOURLY ratio
-        eff = self.env.EFFICIENCY      # (B,)
+        beta = self.env.beta
+        MAXP = self.env.MAXP
         
         da_plans = []
+        da_penalties = []
 
         for h in range(24):
             # 仅约束能源市场（索引0），避免承诺超出可充/可放能力
@@ -305,73 +307,24 @@ class LSTMTrainer(DDRLTrainer):
             action_raw_h = da_plan_24h_raw[:, :, h] # (B, num_markets)
             energy_da_raw = action_raw_h[:, 0]
 
-            # 可放/可充上限（转为[-1,1]尺度下的物理可行范围）
-            # P_discharge_max = (SoC_avail) / (MaxP_ratio_hourly) * efficiency
-            # 因为 discharging 会损耗电量，所以要能够放出的量受制于拥有的电量。
-            # P_charge_max = (Capacity_avail) / (MaxP_ratio_hourly) / efficiency
-            # 充电时，要填满 Empty_Capacity，需要的 Grid Power = Capacity / Efficiency / Time (因为有损耗，充入变少，所以Power要大)
-            # 但这里我们是计算 ACTION (Grid Power) 的限制。
-            # 如果 Grid Power = P，则充入 Battery = P * eff。
-            # 所以 P * eff * Time <= (1-SoC) * Capacity
-            # P <= (1-SoC) * Capacity / Time / eff
-            # MAXPRTRATIO = MaxPower / Capacity / Time_Unit(5min)
-            # maxptr_hourly = MaxPower / Capacity / 1_Hour
-            # 1 / maxptr_hourly = Capacity / MaxPower * Hour
-            # 我们的动作单位是 [-1, 1] 对应 [-MaxPower, MaxPower]
-            # 归一化 SoC 变化量 = Power_Norm * maxptr_hourly
-            # 放电: delta_SoC = P_norm * maxptr_hourly / eff  (这里保持原逻辑 P_gen = P_batt * eff -> P_batt = P_gen / eff ?) 
-            # 稍等，物理必须清晰：
-            # 1. 放电 (Discharge): Grid得到 P. 电池失去 P/eff. (损耗在电池里) -> delta_SoC = - P/eff * dt
-            # 2. 充电 (Charge): Grid失去 P. 电池得到 P*eff. (损耗在电池里) -> delta_SoC = + P*eff * dt
-            # 让我检查环境中的定义 (MetaDataset step 3)
-            # discharge_soc_action = energy_action_rt*(energy_action_rt>0) + ...
-            # new_soc = self._soc[-1] - self.MAXPRTRATIO * (discharge + charge)
-            # 如果 discharge (action>0), delta_soc 减去 action * ratio. 
-            # 等等，环境里的 update 好像没有 eff ?
-            # 让我们再 check 一下 MetaDataset.py 的 step 3 部分
+            # 改为软约束模式：直接使用原始动作更新 SoC，并计算惩罚
             
-            # 假设环境里面没有 eff 影响 soc 变化 (这是一个简化，还是我看错了)
-            # 根据上次 read_file MetaDataset:412
-            # discharge_soc_action = energy_action_rt*(energy_action_rt>0) + 0.25*regup_action_rt/self.EFFICIENCY
-            # charge_soc_action = energy_action_rt*(energy_action_rt<=0) - ...
-            # 这里的 energy_action_rt 似乎没有除以效率？
+            # 1. Update SoC based on raw action
+            virtual_soc = virtual_soc - maxptr_hourly * energy_da_raw
             
-            # 再看 MetaDataset.py 414:
-            # new_soc = self._soc[-1]-self.MAXPRTRATIO*total_soc_discharge_action
+            # 2. Calculate soft constraint penalty (Match MetaDataset Logic)
+            # Penalty = - (50 / beta^2) * MAXP * [ (soc-(1-b))^2 * I(soc>1-b) + (soc-b)^2 * I(soc<b) ]
             
-            # 显然，在 Environment 中：
-            # 放电 (Action > 0): SoC 减少 Action * Ratio
-            # 充电 (Action < 0): SoC 减少 (负值) * Ratio = SoC 增加 |Action| * Ratio
+            penalty_high = (virtual_soc - (1-beta))**2 * (virtual_soc > (1-beta))
+            penalty_low = (virtual_soc - beta)**2 * (virtual_soc < beta)
             
-            # 所以环境假设充放电效率都在"外部"结算(钱)，或者单纯假设电池充放电对于SoC是线性的1:1？
-            # 实际上第412行 charge_soc_action 里面只有 regdown 除以了 EFFICIENCY。energy_action 并没有。
-            # 哪怕有疑惑，我们必须与环境(MetaDataset)保持一致！
+            # Adjusted penalty coefficient to 1.0 to balance market revenue and constraints
+            step_penalty = - (1.0 / (beta**2)) * MAXP * (penalty_high + penalty_low)
             
-            # 修正策略：严格匹配 MetaDataset.py 中的 SoC 更新公式。
-            # Environment: new_soc = old_soc - ratio * action
-            # 约束: 0 <= new_soc <= 1
-            # 0 <= old_soc - ratio * action <= 1
-            # action * ratio <= old_soc  => action <= old_soc / ratio (放电上限)
-            # action * ratio >= old_soc - 1 => action >= (old_soc - 1) / ratio (充电上限，负值)
+            da_penalties.append(step_penalty)
             
-            max_discharge = virtual_soc / (maxptr_hourly + 1e-8)
-            max_charge = (1 - virtual_soc) / (maxptr_hourly + 1e-8) # 这是一个正数，表示幅度
-            
-            energy_da_clamped = torch.clamp(energy_da_raw, -max_charge, max_discharge)
-            
-            # Construct constrained action for this hour
-            if self.num_markets > 1:
-                action_constrained_h = torch.cat([energy_da_clamped.unsqueeze(1), action_raw_h[:, 1:]], dim=1)
-            else:
-                action_constrained_h = energy_da_clamped.unsqueeze(1)
-            
-            da_plans.append(action_constrained_h)
-
-            # 前向推演 SoC（仅按 DA 能源动作，忽略调频/备用影响）
-            # 匹配环境逻辑：delta_soc = - action * ratio
-            virtual_soc = virtual_soc - maxptr_hourly * energy_da_clamped
-            # Ensure virtual_soc stays in bounds for next step calculation
-            virtual_soc = torch.clamp(virtual_soc, 0.0, 1.0)
+            # 3. Use raw action for plan (No Clamping)
+            da_plans.append(action_raw_h)
             
         # Stack to get (Batch, num_markets, 24)
         da_plan_24h = torch.stack(da_plans, dim=2)
@@ -441,8 +394,19 @@ class LSTMTrainer(DDRLTrainer):
                 # Call environment with Two-Stage Settlement
                 soc,rew,lmp,info = self.env.mini_batch_step(action_rt, action_da=da_action_current_hour, verbose_profit=verbose) # PC+1~
                 
+                # [关键修改] 注入日前软约束惩罚
+                # 将日前规划阶段计算的惩罚叠加到当前的 Reward 中
+                # Average the penalty over the 12 steps of the hour (or apply once?)
+                # Apply full penalty per step or distribute? 
+                # Ideally, if step_penalty is for the hour, we add it to the hourly reward mass.
+                # Here we add it to every step (1/12th) or just add full?
+                # The violation happened "at this hour". To be strong, let's add full penalty per step or divide by 12.
+                # Given current magnitude (50/beta^2 approx 50/0.0004 = 125,000!), it's HUGE.
+                # Let's divide by 12 to spread it over the hour.
+                total_step_reward = rew + da_penalties[hour] / 12.0
+                
                 socs.append(soc)
-                rews.append(rew)
+                rews.append(total_step_reward)
                 lmps.append(lmp)
                 actions.append(action_rt)
                 if verbose:

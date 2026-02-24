@@ -229,7 +229,7 @@ class MetaDatasetAEMO(MetaDataset):
         shape = (self.num_agents,)
         # https://www.nrel.gov/docs/fy23osti/85878.pdf 大部分BESS是4hr
         self.MAXSOC = np.random.uniform(low=self.env_config['soc'], high=self.env_config['soc'], size=shape) if MAXSOC is None else np.array(MAXSOC).reshape(-1)# x MWH
-        deg_cost = self.env_config.get('degradation_cost', 50.0)
+        deg_cost = self.env_config.get('degradation_cost', 10.0)
         self.DEGRATIO = np.random.uniform(low=deg_cost, high=deg_cost, size=shape) if DEGRATIO is None else np.array(DEGRATIO).reshape(-1) # $/MWH-cycle
         self.EFFICIENCY = np.random.uniform(low=np.sqrt(0.9), high=np.sqrt(0.9), size=shape) if EFFICIENCY is None else np.array(EFFICIENCY).reshape(-1)# single direction efficiency
         self.MAXPRTRATIO = self.MAXP/(self.MAXSOC)/12.# percentage can be changed in SoC with Maximun Power(without considering efficiency)
@@ -490,12 +490,13 @@ class MetaDatasetAEMO(MetaDataset):
             }
             if action_da is not None:
                 # [Modified] Calculate DA Revenue per market (Batch, 9)
-                rev_da_energy = energy_action_da * lmps_da[:,0]
+                # User Request: DA Revenue = Q_DA * (P_DA - P_RT) (Arbitrage)
+                rev_da_energy = energy_action_da * (lmps_da[:,0] - lmps_rt[:,0])
                 
                 rev_da_as_list = []
                 for i in range(8):
                     if i + 1 < self.num_markets:
-                        rev_da_as_list.append(as_da[i] * lmps_da[:,i+1])
+                        rev_da_as_list.append(as_da[i] * (lmps_da[:,i+1] - lmps_rt[:,i+1]))
                     else:
                         rev_da_as_list.append(torch.zeros_like(rev_da_energy))
                 

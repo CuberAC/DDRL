@@ -6,4 +6,5 @@ logs/
 .archive/
 wandb/
 *.pkl
-.vscode
+*.png
+.vscodeeval_results_custom/
