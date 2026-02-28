@@ -119,14 +119,14 @@ class MetaDatasetAEMO(MetaDataset):
         # numpify the price data
         # A. Process Real-Time Data (RT)
         self._lmp_rt = self.df_data[self.market_keys_rt].to_numpy()
-        self._lmp_rt_normalized = (self.df_data[self.market_keys_rt]-self.price_mean)/self.price_std
+        self._lmp_rt_normalized = (self.df_data[self.market_keys_rt]-self.price_mean)/(self.price_std)
         self._lmp_rt_normalized = self._lmp_rt_normalized.to_numpy()
 
         # B. Process Day-Ahead Data (DA)
         if set(self.market_keys_da).issubset(self.df_data.columns):
             self._lmp_da = self.df_data[self.market_keys_da].to_numpy()
             # IMPORTANT: Normalize DA using RT stats to preserve price spread
-            self._lmp_da_normalized = (self.df_data[self.market_keys_da].values - self.price_mean.values) / self.price_std.values
+            self._lmp_da_normalized = (self.df_data[self.market_keys_da].values - self.price_mean.values) / (self.price_std.values)
         else:
             print("\033[91mWARNING: Day-Ahead (DA) data not found. Fallback: Copying RT data to DA.\033[0m")
             self._lmp_da = self._lmp_rt.copy()
@@ -166,7 +166,7 @@ class MetaDatasetAEMO(MetaDataset):
         if self.num_markets > 1:
             self.price_range[:,1:] = np.linspace(-0.1,50,self.M).reshape(-1,1).repeat(self.num_markets-1,axis = 1)
 
-        self.price_range_normalized = (self.price_range-self.price_mean.to_numpy())/self.price_std.to_numpy()
+        self.price_range_normalized = (self.price_range-self.price_mean.to_numpy())/(self.price_std.to_numpy() + 1e-6)
 
 
         # # TEMP for debug # print color red "Warning, Energy only markey for debug"

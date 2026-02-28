@@ -11,7 +11,7 @@ sys.path.append(os.getcwd())
 # Import necessary classes
 from meta_bidding.train.ddrl.ddrl_trainer import LSTMTrainer
 
-def explicit_calculation_check(model_path, target_date_str='2022-01-30', env_config=None, device='cuda:0'):
+def explicit_calculation_check(model_path, target_date_str='2022-07-29', env_config=None, device='cuda:0'):
     print(f"Loading model from {model_path}...")
     trainer = LSTMTrainer(batch_size=1, seq_len=1, device=device, env_config=env_config)
     trainer.load(model_path)

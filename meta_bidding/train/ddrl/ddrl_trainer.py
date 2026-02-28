@@ -43,6 +43,24 @@ class DDRLTrainer(nn.Module):
         eps_rew.append(-loss.detach().cpu().numpy())
         self.optimizer.zero_grad()
         loss.backward()
+        
+        # --- DEBUG: Check Gradient Flow ---
+        da_grad_norm = 0.0
+        for name, param in self.da_decoder.named_parameters():
+            if param.grad is not None:
+                da_grad_norm += param.grad.norm().item()
+        
+        rt_grad_norm = 0.0
+        for name, param in self.rt_decoder.named_parameters():
+            if param.grad is not None:
+                rt_grad_norm += param.grad.norm().item()
+                
+        if da_grad_norm == 0.0:
+            print(f"[WARNING] DA Decoder Gradient is DOAD (Zero)! RT Grad: {rt_grad_norm:.4f}")
+        # else:
+        #     print(f"[DEBUG] DA Grad: {da_grad_norm:.4f} | RT Grad: {rt_grad_norm:.4f}")
+        # ----------------------------------
+
         nn.utils.clip_grad_norm_(self.layers.parameters(), max_norm=10, norm_type = 2)
         self.optimizer.step()
 
@@ -145,6 +163,7 @@ class LSTMTrainer(DDRLTrainer):
         super(LSTMTrainer,self).__init__(batch_size=batch_size,seq_len=seq_len,learning_rate=learning_rate,device=device,env_config=env_config)
         
         self.num_markets = env_config.get('num_markets', 9)
+        self.mode = env_config.get('mode', 'default') # Training mode
         
         # input shape (batch_size, 18, 96)
         # Note: Input size = (mean(num_markets) + std(num_markets)) = 2 * num_markets
@@ -185,49 +204,6 @@ class LSTMTrainer(DDRLTrainer):
         # 2. Real-Time Decoder (RT)
         # Input: History (12) + Current Obs (4) + MCP (1) + DA Commitment (1) = 18
         # Adjusted Input: History(12) + Current Obs (1+2+self.num_markets) + Known SoC(1*num_markets) + MCP(1*num_markets) + DA(1*num_markets)
-        # Wait, let's trace rt_input construction in one_minibatch_step:
-        # rt_input = cat([encoded_H(6), encoded_inday_hist(6), X(?), known_soc(1), mcp(1), da_action(1)], axis=-1)
-        # X comes from get_minibatch_obs: [lmp(num_markets), positional_encoding(2)] -> size = num_markets + 2
-        # So total input size per market?
-        # The rt_decoder is ClassWiseLinear(num_markets, input_dim, ...). 
-        # The inputs are repeated to have shape (Batch, num_markets, input_dim).
-        # encoded_H: (Batch, num_markets, 6)
-        # encoded_inday_hist: (Batch, num_markets, 6)
-        # X: (Batch, num_markets+2) -> This might be an issue if X is not per-market.
-        # Let's check get_minibatch_obs inside MetaDataset.
-        
-        # rt_input_dim = 6 + 6 + (num_markets + 2) + 1 + 1 + 1 = 17 + num_markets ??
-        # In original code with 9 markets: 6+6+4+1+1 = 18?
-        # Original X was (Batch, 4): lmp(1? no, lmp is 9), positional(2).
-        # Wait, get_minibatch_obs_rnn returns: np.concatenate([self._lmp_normalized[self._pcs], self.positional_encoding_timeofday[self._pcs]], axis=-1)
-        # _lmp_normalized is (Batch, 9). pos_enc is (Batch, 2). Total X is (Batch, 11).
-        
-        # BUT, in one_minibatch_step used "if not HDB: X = self.env.get_minibatch_obs()".
-        # Let's see get_minibatch_obs in next turn.
-        
-        # Assuming for now we fix the decoder size dynamically too.
-        # Reviewing one_minibatch_step again:
-        # rt_input concat axis=-1.
-        # encoded_H: (B, num_markets, 6)
-        # encoded_inday_hist: (B, num_markets, 6)
-        # X: (B, num_markets + 2) -> This is broadcasted? No, it's (B, obs_dim).
-        # To concatenate with (B, num_markets, ...), X needs to be (B, num_markets, ...).
-        # In original code: X was probably reshaped or something?
-        # Let's check one_minibatch_step carefully.
-        
-        # Original: rt_input = torch.cat([..., X, ...])
-        # If X is (B, 11), and others are (B, 9, 6), this cat would fail unless X is unsqueezed and repeated OR specific dims match.
-        # Actually X was just X. The ClassWiseLinear expects (Batch, Class, In_Features).
-        # So ALL inputs must be (Batch, num_markets, something).
-        # If X is (Batch, num_markets+2), it cannot be simply concatenated to (Batch, num_markets, 6) along last dim?
-        # No, it must mean X is treated as features common to all markets? No ClassWiseLinear logic handles "Class" dimension.
-        
-        # Let's look at ClassWiseLinear input requirement.
-        # If input is (Batch, Class, Feature), ClassWiseLinear works.
-        # So X must be expanded to (Batch, num_markets, Feature).
-        # In original code: X = self.env.get_minibatch_obs().
-        
-        # We need to read get_minibatch_obs to be sure.
         
         self.da_decoder = nn.Sequential(
             ClassWiseLinear(self.num_markets, 6+6, 128),
@@ -290,6 +266,10 @@ class LSTMTrainer(DDRLTrainer):
         # DA Input: Long-term + Initial Short-term
         da_input = torch.cat([encoded_H, encoded_inday_hist_init], dim=-1)
         da_plan_24h_raw = self.da_decoder(da_input) # Shape: (Batch, num_markets, 24)
+        
+        # [Modified] RT Only Mode: Force DA Action to 0
+        if self.mode == 'rt_only':
+            da_plan_24h_raw = torch.zeros_like(da_plan_24h_raw)
         
         # --- SoC-aware DA plan (energy市场约束) ---
         # Remvoed no_grad to allow gradient flow for DDRL
@@ -365,7 +345,6 @@ class LSTMTrainer(DDRLTrainer):
                     
                     action_raw = self.rt_decoder(rt_input).squeeze(-1)
                     action_rt = action_raw
-                    
                     mono_supply_curves, price_bids, power_bids = None, None, None
                 else: # Generate HDB for bidding
                     with torch.no_grad():
@@ -391,6 +370,12 @@ class LSTMTrainer(DDRLTrainer):
                         action_rt_numpy = self.env.get_action_hdb(price_bids, power_bids) # action tensor of shape (9,1)
                         action_rt = torch.tensor(action_rt_numpy, device = self.device, dtype = torch.float32).reshape(self.num_markets,1)
                 
+                # [Modified] DA Only Mode: Force RT Action = DA Action (Apply to both HDB and Point-Estimate modes)
+                # Note: HDB path returns (Num_Markets, 1), need to ensure broadcasting or reshaping if Batch > 1
+                # Given current HDB implementation seems specific to Batch=1 or handled internally, we apply override here.
+                if self.mode == 'da_only':
+                    action_rt = da_action_current_hour
+
                 # Call environment with Two-Stage Settlement
                 soc,rew,lmp,info = self.env.mini_batch_step(action_rt, action_da=da_action_current_hour, verbose_profit=verbose) # PC+1~
                 

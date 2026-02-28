@@ -32,6 +32,10 @@ parser.add_argument("--soc",default=4,type=float,help="The fixed soc hour of the
 parser.add_argument("--degradation_cost",default=10.0,type=float,help="Battery degradation cost ($/MWH-cycle)")
 parser.add_argument('--node',choices=['AECO'],default=['AECO'],nargs='+',help='Choose the node')
 
+# [Modified] Add Training Mode for Ablation Study
+parser.add_argument("--mode", choices=['default', 'da_only', 'rt_only'], default='default', 
+                    help="Training mode: default (Dual Market), da_only (Day-Ahead Only), rt_only (Real-Time Only)")
+
 parser.add_argument("--checkpoint",default=None,type=str,help="checkpoint path")
 
 
@@ -96,6 +100,7 @@ if __name__ == "__main__":
     print("episode length: ",args.eps_len)
     print("model saved every ",args.save_model_freq, "epoches")
     print("optimizer learning rate : ", args.lr)
+    print("Training Mode : ", args.mode)
     if args.random_seed:
         print("--------------------------------------------------------------------------------------------")
         print("setting random seed to ", args.random_seed)
