@@ -19,3 +19,6 @@ To test the trained agent, you can use the following command:
 # Change the variable `ckpt_list` in the `scan_ddrl_aemo.py` file to checkpoint path.
 python meta_bidding/train/ddrl/scan_ddrl_aemo.py
 ```
+
+python meta_bidding/train/ddrl/train.py --product energy --soc 4 --node AECO --total_epoches 1000 --mode da_only --exp_name da_only
+python meta_bidding/train/ddrl/train.py --product energy --soc 4 --node AECO --total_epoches 1000 --mode rt_only --exp_name rt_only

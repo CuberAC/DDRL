@@ -489,26 +489,35 @@ class MetaDatasetAEMO(MetaDataset):
                 'lmp_da': lmps_da_numpy,
             }
             if action_da is not None:
-                # [Modified] Calculate DA Revenue per market (Batch, 9)
-                # User Request: DA Revenue = Q_DA * (P_DA - P_RT) (Arbitrage)
-                rev_da_energy = energy_action_da * (lmps_da[:,0] - lmps_rt[:,0])
+                # [Corrected] Calculate DA Settlement Revenue: Q_DA * P_DA
+                rev_da_energy = energy_action_da * lmps_da[:,0]
+                
+                # [Corrected] Calculate RT Deviation Revenue: (Q_RT - Q_DA) * P_RT
+                rev_rt_dev_energy = (energy_action_rt - energy_action_da) * lmps_rt[:,0]
                 
                 rev_da_as_list = []
+                rev_rt_dev_as_list = []
+                
                 for i in range(8):
                     if i + 1 < self.num_markets:
-                        rev_da_as_list.append(as_da[i] * (lmps_da[:,i+1] - lmps_rt[:,i+1]))
+                        # AS DA Rev
+                        rev_da_as_list.append(as_da[i] * lmps_da[:, i+1])
+                        # AS RT Dev Rev
+                        rev_rt_dev_as_list.append((as_rt[i] - as_da[i]) * lmps_rt[:, i+1])
                     else:
                         rev_da_as_list.append(torch.zeros_like(rev_da_energy))
+                        rev_rt_dev_as_list.append(torch.zeros_like(rev_da_energy))
                 
                 rev_da_as = torch.stack(rev_da_as_list, dim=1)
-                rev_da_matrix = torch.cat([rev_da_energy.unsqueeze(1), rev_da_as], dim=1) * self.MAXP
+                rev_rt_dev_as = torch.stack(rev_rt_dev_as_list, dim=1)
                 
-                # [Modified] Calculate Total Revenue per market (Batch, 9)
-                # reward_market_revenue_per_market is already (Batch, 9) and contains total revenue
+                # Concatenate Energy (idx 0) and AS (idx 1-8)
+                rev_da_matrix = torch.cat([rev_da_energy.unsqueeze(1), rev_da_as], dim=1) * self.MAXP
+                rev_rt_dev_matrix = torch.cat([rev_rt_dev_energy.unsqueeze(1), rev_rt_dev_as], dim=1) * self.MAXP
                 
                 info['rev_da'] = rev_da_matrix.cpu().numpy() # Shape: (Batch, 9)
+                info['rev_rt_deviation'] = rev_rt_dev_matrix.cpu().numpy() # New Field
                 info['rev_total'] = reward_market_revenue_per_market.cpu().numpy() # Shape: (Batch, 9)
-                info['rev_rt_deviation'] = info['rev_total'] - info['rev_da'] # Shape: (Batch, 9)
                 
                 # Add per-market reward (Revenue)
                 info['reward_per_market'] = (reward_market_revenue_per_market).cpu().numpy()

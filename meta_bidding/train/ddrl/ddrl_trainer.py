@@ -80,7 +80,6 @@ class DDRLTrainer(nn.Module):
             'da_action': [], 
             'reward': [],
             'rev_da': [],
-            'rev_rt_deviation': [],
             'rev_total': [],
         }
         
@@ -102,7 +101,6 @@ class DDRLTrainer(nn.Module):
             # Collect Financial Stats if available
             if 'rev_da' in info:
                 logs['rev_da'].append(info['rev_da'])
-                logs['rev_rt_deviation'].append(info['rev_rt_deviation'])
                 logs['rev_total'].append(info['rev_total'])
 
         # 3. Data Aggregation
@@ -130,7 +128,6 @@ class DDRLTrainer(nn.Module):
              # Based on MetaDataset logic, rev_da is calculated per step but accumulated? 
              # Actually in MetaDataset it returns step-wise revenue. So concatenate.
              results['rev_da'] = np.concatenate(logs['rev_da'], axis=0)
-             results['rev_rt_deviation'] = np.concatenate(logs['rev_rt_deviation'], axis=0)
              results['rev_total'] = np.concatenate(logs['rev_total'], axis=0)
 
         # Calculate Mean Profit for compatibility
@@ -190,10 +187,10 @@ class LSTMTrainer(DDRLTrainer):
         # --- New Decoders for Two-Stage Settlement ---
         
         # 1. Day-Ahead Decoder (DA)
-        # Input: Long-term History (6) + Short-term History (6) = 12
+        # Input: Long-term History (6) + Short-term History (6) + Initial SOC (1) = 13
         # Output: 24 hours of actions for each market
         self.da_decoder = nn.Sequential(
-            ClassWiseLinear(self.num_markets, 6+6, 128),
+            ClassWiseLinear(self.num_markets, 6+6+1, 128),
             nn.ReLU(),
             ClassWiseLinear(self.num_markets, 128, 128),
             nn.ReLU(),
@@ -204,15 +201,6 @@ class LSTMTrainer(DDRLTrainer):
         # 2. Real-Time Decoder (RT)
         # Input: History (12) + Current Obs (4) + MCP (1) + DA Commitment (1) = 18
         # Adjusted Input: History(12) + Current Obs (1+2+self.num_markets) + Known SoC(1*num_markets) + MCP(1*num_markets) + DA(1*num_markets)
-        
-        self.da_decoder = nn.Sequential(
-            ClassWiseLinear(self.num_markets, 6+6, 128),
-            nn.ReLU(),
-            ClassWiseLinear(self.num_markets, 128, 128),
-            nn.ReLU(),
-            ClassWiseLinear(self.num_markets, 128, 24), # Output 24 steps at once
-            nn.Tanh(),
-        ).to(self.device)
 
         # We will update rt_decoder input size after checking get_minibatch_obs
         # Placeholder for now, assumed dynamic calculation in next steps
@@ -263,8 +251,12 @@ class LSTMTrainer(DDRLTrainer):
         encoded_inday_hist_init,_ = self.lstm_encoder2(inday_hist_init)
         encoded_inday_hist_init = self.lstm_encoder2_compress(encoded_inday_hist_init[:,-1:,:]).repeat((1,self.num_markets,1))
         
-        # DA Input: Long-term + Initial Short-term
-        da_input = torch.cat([encoded_H, encoded_inday_hist_init], dim=-1)
+        # [新增] 获取并调整初始 SOC 的维度: (Batch,) -> (Batch, self.num_markets, 1)
+        known_soc_init = self.env._soc[-1].detach().clone()
+        known_soc_init_expanded = known_soc_init.unsqueeze(1).repeat(1, self.num_markets).unsqueeze(-1)
+        
+        # DA Input: Long-term (6) + Initial Short-term (6) + Initial SOC (1)
+        da_input = torch.cat([encoded_H, encoded_inday_hist_init, known_soc_init_expanded], dim=-1)
         da_plan_24h_raw = self.da_decoder(da_input) # Shape: (Batch, num_markets, 24)
         
         # [Modified] RT Only Mode: Force DA Action to 0
@@ -286,11 +278,23 @@ class LSTMTrainer(DDRLTrainer):
             # Get raw actions for this hour
             action_raw_h = da_plan_24h_raw[:, :, h] # (B, num_markets)
             energy_da_raw = action_raw_h[:, 0]
-
-            # 改为软约束模式：直接使用原始动作更新 SoC，并计算惩罚
             
-            # 1. Update SoC based on raw action
-            virtual_soc = virtual_soc - maxptr_hourly * energy_da_raw
+            # 提取调频动作（如果有的话，需从 Tanh 的 [-1, 1] 映射到 [0, 1]）
+            if self.num_markets > 1:
+                regup_da_raw = action_raw_h[:, 1] / 2 + 0.5
+                regdown_da_raw = action_raw_h[:, 2] / 2 + 0.5
+            else:
+                regup_da_raw = torch.zeros_like(energy_da_raw)
+                regdown_da_raw = torch.zeros_like(energy_da_raw)
+
+            efficiency = self.env.EFFICIENCY
+            # 区分充放电并计入效率损失和辅助服务容量
+            discharge_soc_action_da = energy_da_raw * (energy_da_raw > 0) + 0.25 * regup_da_raw / efficiency
+            charge_soc_action_da = energy_da_raw * (energy_da_raw <= 0) - 0.25 * regdown_da_raw / efficiency
+            total_soc_action_da = discharge_soc_action_da + charge_soc_action_da
+            
+            # 1. Update SoC based on realistic physical consumption
+            virtual_soc = virtual_soc - maxptr_hourly * total_soc_action_da
             
             # 2. Calculate soft constraint penalty (Match MetaDataset Logic)
             # Penalty = - (50 / beta^2) * MAXP * [ (soc-(1-b))^2 * I(soc>1-b) + (soc-b)^2 * I(soc<b) ]
@@ -315,6 +319,7 @@ class LSTMTrainer(DDRLTrainer):
         lmps_da = []
         rewards_per_market = []
         rev_das, rev_totals, rev_rt_deviations = [], [], []
+
         for hour in range(24):
             # Get DA action for this hour
             # Clone to avoid in-place modification error (RuntimeError: ... modified by an inplace operation)
@@ -379,16 +384,16 @@ class LSTMTrainer(DDRLTrainer):
                 # Call environment with Two-Stage Settlement
                 soc,rew,lmp,info = self.env.mini_batch_step(action_rt, action_da=da_action_current_hour, verbose_profit=verbose) # PC+1~
                 
-                # [关键修改] 注入日前软约束惩罚
-                # 将日前规划阶段计算的惩罚叠加到当前的 Reward 中
-                # Average the penalty over the 12 steps of the hour (or apply once?)
-                # Apply full penalty per step or distribute? 
-                # Ideally, if step_penalty is for the hour, we add it to the hourly reward mass.
-                # Here we add it to every step (1/12th) or just add full?
-                # The violation happened "at this hour". To be strong, let's add full penalty per step or divide by 12.
-                # Given current magnitude (50/beta^2 approx 50/0.0004 = 125,000!), it's HUGE.
-                # Let's divide by 12 to spread it over the hour.
-                total_step_reward = rew + da_penalties[hour] / 12.0
+                # [关键修改] 注入日前软约束惩罚并防止双重扣款
+                if self.mode == 'da_only':
+                    # 在 da_only 模式下，action_rt 被覆盖为 DA 动作，
+                    # 底层的 env.mini_batch_step 已经计算了真实的物理越限惩罚放入了 rew 中。
+                    # 因此这里直接使用 rew，不叠加虚拟惩罚，避免双重扣款导致梯度崩溃。
+                    total_step_reward = rew
+                else:
+                    # 在正常双阶段模式下，DA 动作不影响底层真实 SoC，
+                    # 必须额外加上 da_penalties 才能约束 DA 网络的输出。
+                    total_step_reward = rew + da_penalties[hour] / 12.0
                 
                 socs.append(soc)
                 rews.append(total_step_reward)
@@ -426,6 +431,4 @@ class LSTMTrainer(DDRLTrainer):
                 ret['rev_total'] = np.stack(rev_totals, axis=0)
                 if len(rev_rt_deviations) > 0:
                     ret['rev_rt_deviation'] = np.stack(rev_rt_deviations, axis=0)
-                else:
-                    ret['rev_rt_deviation'] = ret['rev_total'] - ret['rev_da']
             return ret
