@@ -29,12 +29,19 @@ class DDRLTrainer(nn.Module):
     def train_eps(self):
         # 0. Initialize the hidden values
         eps_rew = [] # Store the reward of each episode
+        eps_da_pen = [] 
+        eps_rt_pen = []
         loss = 0 # Store the loss of each episode
         self.reset() #  Reset the environment
         
         # 2. rollout one episode
         for step in range(self.seq_len):
-            rew = self.one_minibatch_step() # rew: 24h*(batch_size), type: List[torch.tensor]
+            rew, da_pen, rt_pen = self.one_minibatch_step() # rew: 24h*(batch_size), type: List[torch.tensor]
+            
+            # Record penalties
+            eps_da_pen.append(torch.stack(da_pen).mean().detach().cpu().item())
+            eps_rt_pen.append(torch.stack(rt_pen).mean().detach().cpu().item())
+
             rew = torch.stack(rew) # rew: (24h, batch_size), type: torch.tensor
             loss = loss-torch.mean(rew)/self.seq_len
         loss = loss - torch.mean(self.terminal_rew())/self.seq_len
@@ -63,6 +70,10 @@ class DDRLTrainer(nn.Module):
 
         nn.utils.clip_grad_norm_(self.layers.parameters(), max_norm=10, norm_type = 2)
         self.optimizer.step()
+
+        # Save episode-level average penalties for external logging (e.g., wandb)
+        self.current_da_penalty = np.mean(eps_da_pen)
+        self.current_rt_penalty = np.mean(eps_rt_pen)
 
         # -1. return the reward of the episode (dummy)
         return np.mean(eps_rew)
@@ -187,16 +198,23 @@ class LSTMTrainer(DDRLTrainer):
         # --- New Decoders for Two-Stage Settlement ---
         
         # 1. Day-Ahead Decoder (DA)
-        # Input: Long-term History (6) + Short-term History (6) + Initial SOC (1) = 13
-        # Output: 24 hours of actions for each market
+        # Input: Long-term History (6) + Short-term History (6) + Current Virtual SOC (1) + Time of Day (2) + Safe_Dis(1) + Safe_Chg(1) = 17
+        # Output: 1 hour of action for each market (Autoregressive step)
         self.da_decoder = nn.Sequential(
-            ClassWiseLinear(self.num_markets, 6+6+1, 128),
+            ClassWiseLinear(self.num_markets, 6+6+1+2+2, 128),
             nn.ReLU(),
             ClassWiseLinear(self.num_markets, 128, 128),
             nn.ReLU(),
-            ClassWiseLinear(self.num_markets, 128, 24), # Output 24 steps at once
-            nn.Tanh(),
+            ClassWiseLinear(self.num_markets, 128, 1),
+            nn.Softsign(), # <--- 修改1：替换为 Softsign，尾部梯度更厚实，防止软约束梯度死锁
         ).to(self.device)
+
+        # <--- 修改2：零中心极小初始化 --->
+        # 强制网络在训练初期输出趋近于 0，避免随机初始化导致的连续 24 小时越限和梯度崩溃
+        with torch.no_grad():
+            self.da_decoder[4].weights.data *= 0.01  
+            if hasattr(self.da_decoder[4], 'biases') and self.da_decoder[4].biases is not None:
+                self.da_decoder[4].biases.data *= 0.01 
 
         # 2. Real-Time Decoder (RT)
         # Input: History (12) + Current Obs (4) + MCP (1) + DA Commitment (1) = 18
@@ -245,26 +263,13 @@ class LSTMTrainer(DDRLTrainer):
         encoded_H,_= self.lstm_encoder1(H) # encoded_H.shape = (batch_size, 32)
         encoded_H = self.lstm_encoder1_compress(encoded_H[:,-1:,:]).repeat((1,self.num_markets,1))
 
-        # --- New: Generate Day-Ahead Plan ---
-        # We need initial short-term history for DA planning
+        # --- New: Generate Day-Ahead Plan (Autoregressive Sandbox) ---
+        # 1. 获取用于 DA 规划的静态特征（长短历史）
         inday_hist_init = self.env.get_hour_inday_hist().swapaxes(-1,-2)
         encoded_inday_hist_init,_ = self.lstm_encoder2(inday_hist_init)
         encoded_inday_hist_init = self.lstm_encoder2_compress(encoded_inday_hist_init[:,-1:,:]).repeat((1,self.num_markets,1))
         
-        # [新增] 获取并调整初始 SOC 的维度: (Batch,) -> (Batch, self.num_markets, 1)
-        known_soc_init = self.env._soc[-1].detach().clone()
-        known_soc_init_expanded = known_soc_init.unsqueeze(1).repeat(1, self.num_markets).unsqueeze(-1)
-        
-        # DA Input: Long-term (6) + Initial Short-term (6) + Initial SOC (1)
-        da_input = torch.cat([encoded_H, encoded_inday_hist_init, known_soc_init_expanded], dim=-1)
-        da_plan_24h_raw = self.da_decoder(da_input) # Shape: (Batch, num_markets, 24)
-        
-        # [Modified] RT Only Mode: Force DA Action to 0
-        if self.mode == 'rt_only':
-            da_plan_24h_raw = torch.zeros_like(da_plan_24h_raw)
-        
-        # --- SoC-aware DA plan (energy市场约束) ---
-        # Remvoed no_grad to allow gradient flow for DDRL
+        # 2. 初始化沙盘推演的起点 SOC
         virtual_soc = self.env._soc[-1].detach().clone()  # (B,)
         maxptr_hourly = self.env.MAXPRTRATIO * 12.0  # (B,) Convert 5min ratio to HOURLY ratio
         beta = self.env.beta
@@ -273,10 +278,38 @@ class LSTMTrainer(DDRLTrainer):
         da_plans = []
         da_penalties = []
 
+        # 3. 逐小时自回归推演与动作生成
         for h in range(24):
-            # 仅约束能源市场（索引0），避免承诺超出可充/可放能力
-            # Get raw actions for this hour
-            action_raw_h = da_plan_24h_raw[:, :, h] # (B, num_markets)
+            # 获取当前真实的 batch_size (处理最后一个不完整的 batch)
+            curr_b = encoded_H.shape[0]
+            
+            # [核心修复] 生成当前小时的时间周期编码 (Time of Day Encoding)
+            h_sin = np.sin(2 * np.pi * h / 24.0)
+            h_cos = np.cos(2 * np.pi * h / 24.0)
+            time_feat = torch.tensor([h_sin, h_cos], dtype=torch.float32, device=self.device)
+            # 扩展维度对齐: (Batch, num_markets, 2)
+            time_feat_expanded = time_feat.view(1, 1, 2).expand(curr_b, self.num_markets, 2)
+            
+            # 动态构建包含当前 virtual_soc 和 time_feat 的输入特征
+            virtual_soc_expanded = virtual_soc.unsqueeze(1).repeat(1, self.num_markets).unsqueeze(-1)
+
+            # --- [新增: 物理信息引导特征 (Physics-Informed Features)] ---
+            # 计算如果在 1 小时内不越过 beta 边界，理论上最大允许的充放电动作大小 (0.0 ~ 1.0+)
+            # 仅作为输入特征提供给网络，保留 DDRL 软约束学习机制
+            max_safe_dis = ((virtual_soc - beta) / maxptr_hourly).clamp(min=0.0)
+            max_safe_chg = (((1-beta) - virtual_soc) / maxptr_hourly).clamp(min=0.0)
+            
+            feat_max_dis = max_safe_dis.unsqueeze(1).unsqueeze(-1).repeat(1, self.num_markets, 1)
+            feat_max_chg = max_safe_chg.unsqueeze(1).unsqueeze(-1).repeat(1, self.num_markets, 1)
+            
+            # 拼接: 6 + 6 + 1 + 2 + 2 = 17 维
+            da_input = torch.cat([encoded_H, encoded_inday_hist_init, virtual_soc_expanded, time_feat_expanded, feat_max_dis, feat_max_chg], dim=-1)
+            # -------------------------------------------------------------
+            
+            # 预测当前这 1 个小时的动作
+            action_raw_h_unsqueeze = self.da_decoder(da_input) # Shape: (Batch, num_markets, 1)
+            action_raw_h = action_raw_h_unsqueeze.squeeze(-1)  # Shape: (Batch, num_markets)
+            
             energy_da_raw = action_raw_h[:, 0]
             
             # 提取调频动作（如果有的话，需从 Tanh 的 [-1, 1] 映射到 [0, 1]）
@@ -297,25 +330,27 @@ class LSTMTrainer(DDRLTrainer):
             virtual_soc = virtual_soc - maxptr_hourly * total_soc_action_da
             
             # 2. Calculate soft constraint penalty (Match MetaDataset Logic)
-            # Penalty = - (50 / beta^2) * MAXP * [ (soc-(1-b))^2 * I(soc>1-b) + (soc-b)^2 * I(soc<b) ]
-            
             penalty_high = (virtual_soc - (1-beta))**2 * (virtual_soc > (1-beta))
             penalty_low = (virtual_soc - beta)**2 * (virtual_soc < beta)
             
-            # Adjusted penalty coefficient to 1.0 to balance market revenue and constraints
             step_penalty = - (1.0 / (beta**2)) * MAXP * (penalty_high + penalty_low)
             
             da_penalties.append(step_penalty)
             
-            # 3. Use raw action for plan (No Clamping)
+            # 3. Use raw action for plan
             da_plans.append(action_raw_h)
             
-        # Stack to get (Batch, num_markets, 24)
+        # Stack to get full 24h plan: Shape (Batch, num_markets, 24)
         da_plan_24h = torch.stack(da_plans, dim=2)
+        
+        # [Modified] RT Only Mode: Force DA Action to 0
+        if self.mode == 'rt_only':
+            da_plan_24h = torch.zeros_like(da_plan_24h)
         # ------------------------------------
 
         # get action for each five minutes
         socs, rews, lmps, actions = [],[],[],[]
+        rt_penalties = []
         lmps_da = []
         rewards_per_market = []
         rev_das, rev_totals, rev_rt_deviations = [], [], []
@@ -384,12 +419,19 @@ class LSTMTrainer(DDRLTrainer):
                 # Call environment with Two-Stage Settlement
                 soc,rew,lmp,info = self.env.mini_batch_step(action_rt, action_da=da_action_current_hour, verbose_profit=verbose) # PC+1~
                 
+                # --- [新增] 独立计算并记录 RT 的 SOC 物理越限惩罚金额 ---
+                rt_penalty_high = (soc - (1-beta))**2 * (soc > (1-beta))
+                rt_penalty_low = (soc - beta)**2 * (soc < beta)
+                rt_step_penalty = - (50.0 / (beta**2)) * MAXP * (rt_penalty_high + rt_penalty_low)
+                rt_penalties.append(rt_step_penalty)
+                # ----------------------------------------------------
+
                 # [关键修改] 注入日前软约束惩罚并防止双重扣款
                 if self.mode == 'da_only':
-                    # 在 da_only 模式下，action_rt 被覆盖为 DA 动作，
-                    # 底层的 env.mini_batch_step 已经计算了真实的物理越限惩罚放入了 rew 中。
-                    # 因此这里直接使用 rew，不叠加虚拟惩罚，避免双重扣款导致梯度崩溃。
-                    total_step_reward = rew
+                    # DA action is held for 12 RT steps; raw RT penalty can dominate and destabilize gradients.
+                    # Refund most of rt_step_penalty so only a small fraction of physical penalty remains.
+                    refund_ratio = 0.9
+                    total_step_reward = rew - refund_ratio * rt_step_penalty
                 else:
                     # 在正常双阶段模式下，DA 动作不影响底层真实 SoC，
                     # 必须额外加上 da_penalties 才能约束 DA 网络的输出。
@@ -411,7 +453,7 @@ class LSTMTrainer(DDRLTrainer):
 
         # 4. return the key information of today the next_day observations for bidding
         if not verbose:
-            return rews 
+            return rews, da_penalties, rt_penalties
         else:
             ret = {
                 'lmp':np.stack(lmps, axis=0),

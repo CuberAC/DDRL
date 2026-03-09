@@ -131,7 +131,7 @@ if __name__ == "__main__":
 
     # logging file
     log_f = open(log_f_name,"w+")
-    log_f.write('episode,timestep,reward\n')
+    log_f.write('episode,timestep,reward,da_loss,rt_loss\n')
     
     # Create plot directory
     plot_dir = directory + "plots/"
@@ -147,14 +147,20 @@ if __name__ == "__main__":
 
 
     for step in range(args.total_epoches):
-        eps_rew = trainer.train_eps() 
+        eps_rew = trainer.train_eps()
+        eps_da_pen = getattr(trainer, 'current_da_penalty', 0.0)
+        eps_rt_pen = getattr(trainer, 'current_rt_penalty', 0.0)
 
         wandb.log({
             "train_reward": np.clip(eps_rew,-10,np.inf),
+            "da_penalty": eps_da_pen,
+            "rt_penalty": eps_rt_pen,
             "batch_soc_violation": trainer.env.current_soc_violation_freq
         }, step=step)
-        print("Episode : {} \t\t Timestep : {} \t\t Train Reward : {}".format(step, step*args.batch_size*args.eps_len, eps_rew))
-        log_f.write('{},{},{}\n'.format(step, step*args.batch_size*args.eps_len, eps_rew))
+        wandb.log({"da_virtual_penalty": trainer.current_da_penalty}, step=step)
+        wandb.log({"rt_physical_penalty": trainer.current_rt_penalty}, step=step)
+        print("Episode : {} \t\t Timestep : {} \t\t Train Reward : {:.4f} \t DA Pen: {:.4f} \t RT Pen: {:.4f}".format(step, step*args.batch_size*args.eps_len, eps_rew, eps_da_pen, eps_rt_pen))
+        log_f.write('{},{},{},{},{}\n'.format(step, step*args.batch_size*args.eps_len, eps_rew, eps_da_pen, eps_rt_pen))
         log_f.flush()
 
         if step % args.eval_freq == 0:
