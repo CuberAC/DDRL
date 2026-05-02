@@ -5,7 +5,7 @@ from gurobipy import GRB
 import argparse
 import os
 
-def solve_da_only_max(df_day, date_str, soc_max_mwh=4.0, power_max_mw=1.0, efficiency=0.9, initial_soc=0.5):
+def solve_da_only_max(df_day, date_str, soc_max_mwh=4.0, power_max_mw=1.0, efficiency=0.9, initial_soc=0.5, degradation_cost=10.0):
     """
     仅参与日前市场 (DA-Only) 的最优化求解器
     变量按小时 (Hourly) 分布，目标函数求 sum(P_da * Q_da)
@@ -47,9 +47,18 @@ def solve_da_only_max(df_day, date_str, soc_max_mwh=4.0, power_max_mw=1.0, effic
     for t in range(T_optim):
         h = int(t / 12)
         if h >= 24: h = 23
+        
+        # 净出力 (放电 - 充电)
         q_da_net_h = q_da_dis[h] - q_da_chg[h]
-        # 使用积分等效计算：每 5 分钟切片累加相当于小时内均价结算
-        obj_expr += q_da_net_h * da_prices_5min[t] * dt_rt
+        
+        # 1. 市场电费收益 ($)
+        revenue = q_da_net_h * da_prices_5min[t] * dt_rt
+        
+        # 2. 电池老化成本 ($)：仅在放电时产生
+        degradation = degradation_cost * q_da_dis[h] * dt_rt
+        
+        # 3. 累加净利润
+        obj_expr += (revenue - degradation)
         
     m.setObjective(obj_expr, GRB.MAXIMIZE)
     m.optimize()
@@ -58,7 +67,7 @@ def solve_da_only_max(df_day, date_str, soc_max_mwh=4.0, power_max_mw=1.0, effic
         return None
     return m.ObjVal
 
-def solve_rt_only_max(df_day, date_str, soc_max_mwh=4.0, power_max_mw=1.0, efficiency=0.9, initial_soc=0.5):
+def solve_rt_only_max(df_day, date_str, soc_max_mwh=4.0, power_max_mw=1.0, efficiency=0.9, initial_soc=0.5, degradation_cost=10.0):
     """
     仅参与实时市场 (RT-Only) 的最优化求解器
     变量按5分钟 (5-min) 分布，目标函数求 sum(P_rt * Q_rt)
@@ -93,8 +102,17 @@ def solve_rt_only_max(df_day, date_str, soc_max_mwh=4.0, power_max_mw=1.0, effic
     # 目标函数：纯粹的 P_rt * Q_rt
     obj_expr = 0
     for t in range(T_optim):
+        # 净出力
         q_rt_net_t = q_rt_dis[t] - q_rt_chg[t]
-        obj_expr += q_rt_net_t * rt_prices[t] * dt_rt
+
+        # 1. 市场电费收益 ($)
+        revenue = q_rt_net_t * rt_prices[t] * dt_rt
+
+        # 2. 电池老化成本 ($)：仅在放电时产生
+        degradation = degradation_cost * q_rt_dis[t] * dt_rt
+
+        # 3. 累加净利润
+        obj_expr += (revenue - degradation)
         
     m.setObjective(obj_expr, GRB.MAXIMIZE)
     m.optimize()

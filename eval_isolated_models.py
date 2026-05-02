@@ -13,8 +13,8 @@ from meta_bidding.train.ddrl.ddrl_trainer import LSTMTrainer
 # ==========================================
 # 1. 路径配置
 # ==========================================
-DA_MODEL_PATH = "logs/metabidding-ddrl/da_only/20260304-1908/950.pth"
-RT_MODEL_PATH = "logs/metabidding-ddrl/rt_only/20260304-1950/950.pth"
+DA_MODEL_PATH = "logs/metabidding-ddrl/da_only/20260316-1658/950.pth"
+RT_MODEL_PATH = "logs/metabidding-ddrl/rt_only/20260316-1743/50.pth"
 OPTIMAL_RESULTS_PATH = "isolated_bidding_results.csv"
 OUTPUT_CSV = "ddrl_vs_optimal_isolated.csv"
 DEVICE = 'cuda:0'
@@ -84,17 +84,28 @@ def evaluate_single_model(model_path, target_market):
         p_da_24 = p_da_raw_short[:, 0]
         
         profit = 0.0
+        deg_cost = env_config['degradation_cost'] # 10.0
         
         if target_market == 'da_only':
-            # DA Only: sum(Q_da * P_da * 1 hour)
             for h in range(24):
-                profit += q_da_24[h] * p_da_24[h]
-        
+                q = q_da_24[h].item()
+                p = p_da_24[h].item()
+                
+                revenue = q * p  # 收入 (如果是充电，q 为负数，自动变为支出)
+                degradation = deg_cost * q if q > 0 else 0.0 # 仅放电(q>0)时计算老化成本
+                
+                profit += (revenue - degradation)
+                
         elif target_market == 'rt_only':
-            # RT Only: sum(Q_rt * P_rt * dt)
             dt = 1.0 / 12.0 # 5分钟 = 1/12 小时
             for t in range(288):
-                profit += q_rt_288[t] * p_rt_288[t] * dt
+                q = q_rt_288[t].item()
+                p = p_rt_288[t].item()
+                
+                revenue = q * p * dt
+                degradation = deg_cost * q * dt if q > 0 else 0.0 # 仅放电时计算
+                
+                profit += (revenue - degradation)
                 
         daily_profits[date_str] = profit
         

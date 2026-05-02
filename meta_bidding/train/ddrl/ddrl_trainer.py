@@ -198,23 +198,16 @@ class LSTMTrainer(DDRLTrainer):
         # --- New Decoders for Two-Stage Settlement ---
         
         # 1. Day-Ahead Decoder (DA)
-        # Input: Long-term History (6) + Short-term History (6) + Current Virtual SOC (1) + Time of Day (2) + Safe_Dis(1) + Safe_Chg(1) = 17
+        # Input: Long-term History (6) + Short-term History (6) + Current Virtual SOC (1) + Time of Day (2) + Safe_Dis(1) + Safe_Chg(1) + Future DA Prices (24) = 41
         # Output: 1 hour of action for each market (Autoregressive step)
         self.da_decoder = nn.Sequential(
-            ClassWiseLinear(self.num_markets, 6+6+1+2+2, 128),
+            ClassWiseLinear(self.num_markets, 41, 128),
             nn.ReLU(),
             ClassWiseLinear(self.num_markets, 128, 128),
             nn.ReLU(),
             ClassWiseLinear(self.num_markets, 128, 1),
-            nn.Softsign(), # <--- 修改1：替换为 Softsign，尾部梯度更厚实，防止软约束梯度死锁
+            nn.Tanh(), 
         ).to(self.device)
-
-        # <--- 修改2：零中心极小初始化 --->
-        # 强制网络在训练初期输出趋近于 0，避免随机初始化导致的连续 24 小时越限和梯度崩溃
-        with torch.no_grad():
-            self.da_decoder[4].weights.data *= 0.01  
-            if hasattr(self.da_decoder[4], 'biases') and self.da_decoder[4].biases is not None:
-                self.da_decoder[4].biases.data *= 0.01 
 
         # 2. Real-Time Decoder (RT)
         # Input: History (12) + Current Obs (4) + MCP (1) + DA Commitment (1) = 18
@@ -278,6 +271,13 @@ class LSTMTrainer(DDRLTrainer):
         da_plans = []
         da_penalties = []
 
+        # [Oracle Test] 提取未来24小时（每小时1个采样点，跨度12个5min步长）的主能量市场日前电价
+        future_24h_idx = (self.env._pcs.reshape(-1, 1) + np.arange(0, 288, 12)) % self.env.dataset_size
+        # 提取真实价格并转换为 tensor
+        future_24h_prices = torch.tensor(self.env._lmp_da_normalized[future_24h_idx, 0], dtype=torch.float32, device=self.device)
+        # 扩充维度以对齐 num_markets: 形状变为 (Batch, num_markets, 24)
+        feat_future_24h = future_24h_prices.unsqueeze(1).repeat(1, self.num_markets, 1)
+
         # 3. 逐小时自回归推演与动作生成
         for h in range(24):
             # 获取当前真实的 batch_size (处理最后一个不完整的 batch)
@@ -302,8 +302,16 @@ class LSTMTrainer(DDRLTrainer):
             feat_max_dis = max_safe_dis.unsqueeze(1).unsqueeze(-1).repeat(1, self.num_markets, 1)
             feat_max_chg = max_safe_chg.unsqueeze(1).unsqueeze(-1).repeat(1, self.num_markets, 1)
             
-            # 拼接: 6 + 6 + 1 + 2 + 2 = 17 维
-            da_input = torch.cat([encoded_H, encoded_inday_hist_init, virtual_soc_expanded, time_feat_expanded, feat_max_dis, feat_max_chg], dim=-1)
+            # 拼接: 6 + 6 + 1 + 2 + 2 + 24 = 41 维
+            da_input = torch.cat([
+                encoded_H,
+                encoded_inday_hist_init,
+                virtual_soc_expanded,
+                time_feat_expanded,
+                feat_max_dis,
+                feat_max_chg,
+                feat_future_24h,
+            ], dim=-1)
             # -------------------------------------------------------------
             
             # 预测当前这 1 个小时的动作
@@ -430,8 +438,8 @@ class LSTMTrainer(DDRLTrainer):
                 if self.mode == 'da_only':
                     # DA action is held for 12 RT steps; raw RT penalty can dominate and destabilize gradients.
                     # Refund most of rt_step_penalty so only a small fraction of physical penalty remains.
-                    refund_ratio = 0.9
-                    total_step_reward = rew - refund_ratio * rt_step_penalty
+                    refund_ratio = 1.0
+                    total_step_reward = rew - refund_ratio * rt_step_penalty + da_penalties[hour] / 12.0
                 else:
                     # 在正常双阶段模式下，DA 动作不影响底层真实 SoC，
                     # 必须额外加上 da_penalties 才能约束 DA 网络的输出。
